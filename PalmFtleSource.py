@@ -160,18 +160,23 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
 
     # scalar is a one element vector
     @smproperty.doublevector(name="IntegrationTime", number_of_elements=1, default_values=[-10.0])
-    def SetIntegrationTime(self, value, *args):
+    def SetIntegrationTime(self, value):
         self.tintegr = float(value)
         self.Modified()
 
     @smproperty.intvector(name="TimeIndex", number_of_elements=1, default_values=[10])
-    def SetTimeIndex(self, value, *args):
+    def SetTimeIndex(self, value):
         self.time_index = int(value)
         self.Modified()
 
     @smproperty.intvector(name="Frozen", number_of_elements=1, default_values=[0])
-    def SetFrozen(self, value, *args):
+    def SetFrozen(self, value):
         self.frozen = bool(value)
+        self.Modified()
+
+    @smproperty.intvector(name="Verbose", number_of_elements=1, default_values=[0])
+    def SetVerbose(self, value):
+        self.verbose = bool(value)
         self.Modified()
 
     @smproperty.intvector(
