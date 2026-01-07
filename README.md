@@ -1,13 +1,26 @@
 # pv_ftle
 A repository for Paraview plugins that compute the finite time Lyapunov exponent (FTLE) 
 
-## Loading the Paraview PalFtleSource plugin
+## Requirements
+
+You must have the following installed:
+ * Paraview (tested 6.0.1)
+ * a C++ compiler (tested Apple clang version 17.0.0)
+ * CMake (tested 4.1.2)
+
+
+## Building the Paraview PalFtleSource plugin
 
 This directory contains a Paraview plugin  `PalmFtleSource.py`, which computes the finite time Lyapunov exponent for a velocity field on a Arakawa C-grid.
+This Python plugin calls C++ code that needs to be compiled. The plugin uses `pybind11` to extend Python with C++. Start by building `pybind11`, making to 
+sure to use the same python version as Paraview:
 
-## Building the plugin
-
-This plugin calls C++ code that must first be compiled. You must have a C++ compiler, the CMake build tool and the Python `pybind11` module installed (in addition to Paraview).
+```Bash
+git clone https://github.com/pybind/pybind11.git
+cd pybind11
+cd pip install -e .
+cd ..
+```
 
 The steps to build the plugin were tested on Mac OS X with Paraview 6.0.1.
 
@@ -21,9 +34,7 @@ Then, in this directory
 ```bash
 mkdir build
 cd build
-cmake \
-  -DCMAKE_BUILD_TYPE=Release \
- ..
+cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 ```
 Now you should have a shared library `ftlecpp.cpython-312-darwin.so` (the name will change depending on 
