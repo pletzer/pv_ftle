@@ -42,6 +42,7 @@ import netCDF4
 from vtkmodules.vtkCommonDataModel import vtkRectilinearGrid, vtkMultiBlockDataSet
 import vtk
 import time
+import re
 
 # so that Python sees the shared libraries
 import sys, os
@@ -278,7 +279,38 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
             print(f'self.time_index={self.time_index} dt={dt} nt={nt} tmin={tmin} tmax={tmax}')
 
         return tmin, tmax
+    
+    def _get_nc_names(self, nc) -> dict:
+        # --------------------------------------------------------------
+        # Get the field names for u, v, w, x, y, z
+        # --------------------------------------------------------------
+        res = dict()
+        for name, var in nc.variables.items():
+            if re.match(r'^u', name) and getattr(var, 'units', '') == 'm/s':
+                # u velocity detected
+                res['u'] = name
+            elif re.match(r'^v', name) and getattr(var, 'units', '') == 'm/s':
+                res['v'] = name
+            elif re.match(r'^w', name) and getattr(var, 'units', '') == 'm/s':
+                res['w'] = name
+        if 'u' not in res:
+            raise ValueError("Failed to find u velocity")
+        if 'v' not in res:
+            raise ValueError("Failed to find v velocity")
+        if 'w' not in res:
+            raise ValueError("Failed to find w velocity")
+        # get the axes
+        if len(nc.variables[ res['u'] ].shape) != 4:
+            raise ValueError("Wrong number of axes in u velocity, whoucl be 4")
+        res['x'] = nc.variables[ res['u'] ].dimensions[-1]
+        res['y'] = nc.variables[ res['v'] ].dimensions[-2]
+        res['z'] = nc.variables[ res['w'] ].dimensions[-3]
+        res['time'] = nc.variables[ res['w'] ].dimensions[-4]
 
+        if self.verbose:
+            print(f'NetCDF variable names: u: {res["u"]} v: {res["v"]} w: {res["w"]} x: {res["x"]} y: {res["y"]} z: {res["z"]} time: {res["time"]}')
+
+        return res
 
     def _compute_ftle(self) -> dict:
 
@@ -289,6 +321,8 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
 
             tm0 = time.perf_counter()
 
+            fld = self._get_nc_names(nc)
+
             if self.verbose:
                 print(f'self.imin={self.imin} self.imax={self.imax} self.jmin={self.jmin} self.jmax={self.jmax}')
 
@@ -298,17 +332,17 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
             # trajectories to leave the seed region.
  
             # axes for the seeded region
-            xaxis = nc.variables['xu'][self.imin:self.imax+1]
-            yaxis = nc.variables['yv'][self.jmin:self.jmax+1]
-            zaxis = nc.variables['zw_xy'][:] # all the elevations
+            xaxis = nc.variables[ fld['x'] ][self.imin:self.imax+1]
+            yaxis = nc.variables[ fld['y'] ][self.jmin:self.jmax+1]
+            zaxis = nc.variables[ fld['z'] ][:] # read all the elevations
             # full domain axes
-            xaxis_full = nc.variables['xu'][:]
-            yaxis_full = nc.variables['yv'][:]
-            dt = nc.variables['time'][1] - nc.variables['time'][0] # assume constant time step
-            nt_all = nc.variables['time'].size
+            xaxis_full = nc.variables[ fld['x'] ][:]
+            yaxis_full = nc.variables[ fld['y'] ][:]
+            dt = nc.variables[ fld['time'] ][1] - nc.variables[ fld['time'] ][0] # assume constant time step
+            nt_all = nc.variables[ fld['time'] ].size
 
             tmin, tmax = self.select_time_window(dt, nt_all) # tmin and tmax are indices
-            t_axis = nc.variables['time'][tmin:tmax]
+            t_axis = nc.variables[  fld['time'] ][tmin:tmax]
             nt = t_axis.shape[0]
             if not self.frozen and nt < 2:
                 raise ValueError("Need at least two time levels for time-dependent FTLE")
@@ -341,13 +375,13 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
             # x, and all the cells in z. We're also replacing all the nans with zeros. We read all the 
             # velocities to allow trajectories to leave the seed domain
             uface = np.nan_to_num( 
-                nc.variables['u_xy'][tmin:tmax, :, :, :], 
+                nc.variables[ fld['u'] ][tmin:tmax, :, :, :], 
                 copy=False, nan=0.0)
             vface = np.nan_to_num( 
-                nc.variables['v_xy'][tmin:tmax, :, :, :], 
+                nc.variables[ fld['v'] ][tmin:tmax, :, :, :], 
                 copy=False, nan=0.0)
             wface = np.nan_to_num( 
-                nc.variables['w_xy'][tmin:tmax, :, :, :], 
+                nc.variables[ fld['w'] ][tmin:tmax, :, :, :], 
                 copy=False, nan=0.0)
 
             tm1 = time.perf_counter()
