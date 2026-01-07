@@ -1,40 +1,25 @@
 """
-Custom ParaView Python Source plugin to read and compute the Finite Time Lyapunov Exponent 
-from PALM data stored in a NetCDF file. 
+Custom ParaView Python Source plugin to read PALM Netcdf data and compute the 
+Finite Time Lyapunov Exponent 
 
-This version allows the velocity field:
- * to be kept frozen in time
- * or to vary in time 
- as the grid positions are integrated. 
+This version allows the velocity field to either be frozen in time or vary 
+ as the grid point trajectories are being integrated. 
 
 Inputs:
   - palmfile: path to a NetCDF file
   - tintegr: integration time (float)
-  - imin, imax: x-index bounds
+  - imin, imax: x-index bounds for the seeds
   - jmin, jmax: y-index bounds
   - tindex: time index
 
 Reads fields:
-  - u_xy, v_xy, w_xy
+  - u, v, w
 
 Grid:
-  - Assumed 3D, cell-centred output
+  - Assumed 3D rectilinear, cell-centred output
   - Index order assumed (time, k, j, i) = (time, nz, ny, nx)
-  - x and y spacing assumed uniform; z spacing may be nonuniform.
+  - x and y spacing assumed uniform; z spacing can be nonuniform.
 """
-
-
-# ----------------------------------------------------------------------
-# Usage notes:
-# ----------------------------------------------------------------------
-# 1. Save this file as e.g. PalmFtleSource.py
-# 2. In ParaView:
-#    Tools -> Manage Plugins -> Load New -> select this file
-# 3. Add source: Sources -> FTLEPythonSource
-# 4. Set PalmFile, IntegrationTime, imin/imax, jmin/jmax
-# 5. Insert your FTLE kernel where indicated
-# ----------------------------------------------------------------------
-
 
 from paraview.util.vtkAlgorithm import *
 import numpy as np
