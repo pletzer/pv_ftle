@@ -21,7 +21,13 @@ Grid:
   - x and y spacing assumed uniform; z spacing can be nonuniform.
 """
 
-from paraview.util.vtkAlgorithm import *
+from paraview.util.vtkAlgorithm import (
+    VTKPythonAlgorithmBase,
+    smproxy,
+    smproperty,
+    smdomain,
+    smhint,
+)
 import numpy as np
 import netCDF4
 from vtkmodules.vtkCommonDataModel import vtkRectilinearGrid, vtkMultiBlockDataSet
@@ -31,7 +37,8 @@ import re
 
 # so that Python sees the shared libraries
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+plugin_dir = os.path.dirname(globals().get("__file__", os.getcwd()))
+sys.path.insert(0, plugin_dir)
 
 # C++ extensions
 import ftlecpp
@@ -213,7 +220,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
 
         # Build image
         grid = vtkRectilinearGrid()
-        grid.SetDimensions(nx1, ny1, nz1)
+        grid.SetExtent(0, nx1-1, 0, ny1-1, 0, nz1-1)
 
         # convert the numpy arrays to VTK arrays
         x_arr = numpy_support.numpy_to_vtk(num_array=x, deep=True, array_type=vtk.VTK_DOUBLE)
@@ -227,6 +234,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
         # Convert to (x, y, z) = (20, 80, 17)
         ftle_xyz = res['ftle'].transpose((2, 1, 0)).astype(np.float32)  # (nx-1, ny-1, nz-1)
 
+        # VTK expects Fortran order: x fastest, then y, then z
         vtk_arr = numpy_support.numpy_to_vtk(
             num_array=ftle_xyz.ravel(order='F'),   # x fastest, then y, then z
             deep=True,
@@ -240,6 +248,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
 
         # 3. Put it in the multi-block output
         output = vtkMultiBlockDataSet.GetData(outInfo, 0)
+        output.SetNumberOfBlocks(1)
         output.SetBlock(0, grid)
  
         return 1
@@ -291,7 +300,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
             raise ValueError("Failed to find w velocity")
         # get the axes
         if len(nc.variables[ res['u'] ].shape) != 4:
-            raise ValueError("Wrong number of axes in u velocity, whoucl be 4")
+            raise ValueError(f"Wrong number of axes in u velocity, should be 4 but got {len(nc.variables[ res['u'] ].shape)}")
         res['x'] = nc.variables[ res['u'] ].dimensions[-1]
         res['y'] = nc.variables[ res['v'] ].dimensions[-2]
         res['z'] = nc.variables[ res['w'] ].dimensions[-3]
