@@ -28,7 +28,7 @@ In the root `pv_ftle` directory, start by building `pybind11`, making to sure to
 ```Bash
 git clone https://github.com/pybind/pybind11.git
 cd pybind11
-cd pip install -e .
+pip install -e .
 cd ..
 ```
 
