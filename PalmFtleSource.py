@@ -473,10 +473,11 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
                 # zero integration time
                 ftle = np.zeros_like(max_lambda)
 
-            if self.checksum:
+            if self.checksum and self.verbose:
                 print(f'Checksum: {np.fabs(ftle).sum()}')
 
-            print(f"""
+            if self.verbose:
+                print(f"""
 time to read:     {tm1 - tm0:.3f} sec
 time for setup:   {tm2 - tm1:.3f} sec
 time RK4:         {tm3 - tm2:.3f} sec
