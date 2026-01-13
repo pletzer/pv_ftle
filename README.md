@@ -63,6 +63,11 @@ Start Paraview. Under
  * Wait for a few seconds, giving Paraview the time to load the plugin. Then close the `Plugin Manager` window. (It is critical to close the window otherwise the plugin will not be
 loaded.)
 
+Note: to automatically load the plugin when starting ParaView, set
+```
+export PV_PLUGIN_PATH=/path/to/plugin
+```
+
 ## How to invoke the plugin
 
 Go to `Sources` and select `PALM FTLE Source` under the `Alphabetical` menu. Select the `Palm file` in the menu; this is the PALM NetCDF output file that contains the velocity field. Then press `Apply`. Change "Solid Color" to "FTLE" and "Outline" to "Surface".
