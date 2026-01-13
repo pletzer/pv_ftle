@@ -65,7 +65,7 @@ loaded.)
 
 ## How to invoke the plugin
 
-Go to `Sources` and select `PALM FTLE Source` under the `Alphabetical` menu. Select the `Palm NetCDF file` in the menu. Then press `Apply`. Change "Solid Color" to "FTLE" and "Outline" to "Surface".
+Go to `Sources` and select `PALM FTLE Source` under the `Alphabetical` menu. Select the `Palm file` in the menu; this is the PALM NetCDF output file that contains the velocity field. Then press `Apply`. Change "Solid Color" to "FTLE" and "Outline" to "Surface".
 
 ## Volume rendering
 
