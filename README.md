@@ -58,7 +58,7 @@ The steps should be similar to those on Mac OS X. You might need to set `PYTHON_
 ## How to load the plugin
 
 Start Paraview. Under 
- * `Tools` -> `Manage plugins...`
+ * `Tools` -> `Manage Plugins...`
  * then press `Load New`, navigate to the directory where `PalmFtleSource.py` resides. Click on `PalmFtleSource.py` and press `OK`.  
  * Wait for a few seconds, giving Paraview the time to load the plugin. Then close the `Plugin Manager` window. (It is critical to close the window otherwise the plugin will not be
 loaded.)
