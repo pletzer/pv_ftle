@@ -58,14 +58,14 @@ The steps should be similar to those on Mac OS X. You might need to set `PYTHON_
 ## How to load the plugin
 
 Start Paraview. Under 
- * `Tools` -> `Manage plugins...`
+ * `Tools` -> `Manage Plugins...`
  * then press `Load New`, navigate to the directory where `PalmFtleSource.py` resides. Click on `PalmFtleSource.py` and press `OK`.  
  * Wait for a few seconds, giving Paraview the time to load the plugin. Then close the `Plugin Manager` window. (It is critical to close the window otherwise the plugin will not be
 loaded.)
 
 ## How to invoke the plugin
 
-Go to `Sources` and select `PALM FTLE Source` under the `Alphabetical` menu. Select the Palm NetCDF file in the menu. Then press `Apply`. Change "Solid Color" to "FTLE" and "Outline" to "Surface".
+Go to `Sources` and select `PALM FTLE Source` under the `Alphabetical` menu. Select the `Palm file` in the menu; this is the PALM NetCDF output file that contains the velocity field. Then press `Apply`. Change "Solid Color" to "FTLE" and "Outline" to "Surface".
 
 ## Volume rendering
 
