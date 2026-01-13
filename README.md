@@ -9,6 +9,13 @@ You must have the following installed:
  * a C++ compiler (tested Apple clang version 17.0.0)
  * CMake (tested 4.1.2)
 
+We recommed to build in a virtual environment with the dependecies installed
+```
+python -m venv venv 
+source venv/bin/activate
+pip install -r requirements.txt 
+```
+
 
 ## Building the Paraview PalFtleSource plugin
 
