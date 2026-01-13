@@ -23,7 +23,7 @@ This directory contains a Paraview plugin `PalmFtleSource.py`, which computes th
 
 This Python plugin calls C++ code that needs to be compiled. The plugin uses `pybind11` to extend Python with C++. 
 
-Start by building `pybind11`, making to sure to use the same python version as Paraview.
+In the root `pv_ftle` directory, start by building `pybind11`, making to sure to use the same python version as Paraview.
 
 ```Bash
 git clone https://github.com/pybind/pybind11.git
