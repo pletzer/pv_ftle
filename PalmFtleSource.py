@@ -53,17 +53,17 @@ except:
 # -------------------------
 # RK4 step estimate (CFL-like)
 # -------------------------
-def _estimate_nsteps(uface, vface, wface, dx, dy, dz, T, min_steps=20):
+def _estimate_nsteps(uface, vface, wface, dx, dy, dz, cfl, T, min_steps=20):
     """
     Estimate number of RK4 steps using a CFL-like heuristic:
-    nsteps ~ 4 * (Umax * |T| / hmin)
+    nsteps ~ (Umax * |T| / hmin) / cfl
     with lower bound min_steps.
     """
     speed2 = uface*uface + vface*vface + wface*wface
     Umax = np.sqrt(np.nanmax(speed2))
     hmin = min(dx, dy, dz)
     crossings = Umax * abs(T) / hmin
-    return max(int(4.0 * crossings) + 1, min_steps)
+    return max(int(crossings / cfl) + 1, min_steps)
 
 # -------------------------------------
 # Cell centred gradient from point data
@@ -125,6 +125,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
         # ---- user parameters (with defaults) ----
         self.palmfile = ""
         self.tintegr = -10.0
+        self.cfl = 0.25
         self.imin = 0
         self.imax = 1
         self.jmin = 0
@@ -159,6 +160,11 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
     @smproperty.intvector(name="TimeIndex", number_of_elements=1, default_values=[10])
     def SetTimeIndex(self, value):
         self.time_index = int(value)
+        self.Modified()
+
+    @smproperty.doublevector(name="Cfl", number_of_elements=1, default_values=[0.25])
+    def SetCfl(self, value):
+        self.cfl = float(value)
         self.Modified()
 
     @smproperty.intvector(name="Frozen", number_of_elements=1, default_values=[0])
@@ -396,7 +402,11 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
             # [x..., y..., z...] positions.
             # Note: FTLE is computed from corner-seeded trajectories.
             xyz0 = np.concatenate([xflat, yflat, zflat]).astype(np.float64)
-            nsteps = _estimate_nsteps(uface, vface, wface, dx, dy, dz.min(), self.tintegr)
+            nsteps = _estimate_nsteps(uface, vface, wface, 
+                                      dx=dx, dy=dy, dz=dz.min(), 
+                                      cfl=self.cfl, T=self.tintegr)
+            if self.verbose:
+                print(f'nsteps = {nsteps}')
 
             tm2 = time.perf_counter()
 
