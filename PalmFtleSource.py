@@ -140,15 +140,11 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
     # Properties exposed to ParaView GUI
     # ------------------------------------------------------------------
 
-    @smproperty.stringvector(name="PalmFile", number_of_elements=1, default_values=["/Users/apletzer/work/ftle/paraview_plugin/small_blf_day_loc1_4m_xy_N04.003.nc"])
+    @smproperty.stringvector(name="PalmFile", number_of_elements=1, default_values=[""])
     @smdomain.filelist()
     @smhint.filechooser(extensions="nc", file_description="NetCDF files")
     def SetPalmFile(self, value):
-        # ParaView may pass a string or a list
-        if isinstance(value, (list, tuple)):
-            self.palmfile = value[0] if value else ""
-        else:
-            self.palmfile = value
+        self.palmfile = value
         self.Modified()
 
     # scalar is a one element vector
