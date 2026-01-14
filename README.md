@@ -10,6 +10,13 @@ You must have the following installed:
  * CMake (tested 4.1.2)
  * Use the same Python version as that of Paraview, creating a conda environment if need be
 
+We recommed to build in a virtual environment with the dependecies installed
+```
+python -m venv venv 
+source venv/bin/activate
+pip install -r requirements.txt 
+```
+
 
 ## Building the Paraview PalFtleSource plugin
 
@@ -17,7 +24,7 @@ This directory contains a Paraview plugin `PalmFtleSource.py`, which computes th
 
 This Python plugin calls C++ code that needs to be compiled. The plugin uses `pybind11` to extend Python with C++. 
 
-Start by building `pybind11`, making to sure to use the same python version as Paraview.
+In the root `pv_ftle` directory, start by building `pybind11`, making to sure to use the same python version as Paraview.
 
 ```Bash
 git clone https://github.com/pybind/pybind11.git
@@ -52,14 +59,19 @@ The steps should be similar to those on Mac OS X. You might need to set `PYTHON_
 ## How to load the plugin
 
 Start Paraview. Under 
- * `Tools` -> `Manage plugins...`
+ * `Tools` -> `Manage Plugins...`
  * then press `Load New`, navigate to the directory where `PalmFtleSource.py` resides. Click on `PalmFtleSource.py` and press `OK`.  
  * Wait for a few seconds, giving Paraview the time to load the plugin. Then close the `Plugin Manager` window. (It is critical to close the window otherwise the plugin will not be
 loaded.)
 
+Note: to automatically load the plugin when starting ParaView, set
+```
+export PV_PLUGIN_PATH=/path/to/plugin
+```
+
 ## How to invoke the plugin
 
-Go to `Sources` and select `PALM FTLE Source` under the `Alphabetical` menu. Select the Palm NetCDF file in the menu. Then press `Apply`. Change "Solid Color" to "FTLE" and "Outline" to "Surface".
+Go to `Sources` and select `PALM FTLE Source` under the `Alphabetical` menu. Select the `Palm file` in the menu; this is the PALM NetCDF output file that contains the velocity field. Then press `Apply`. Change "Solid Color" to "FTLE" and "Outline" to "Surface".
 
 ## Volume rendering
 

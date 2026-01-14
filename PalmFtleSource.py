@@ -140,15 +140,11 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
     # Properties exposed to ParaView GUI
     # ------------------------------------------------------------------
 
-    @smproperty.stringvector(name="PalmFile", number_of_elements=1, default_values=["/Users/apletzer/work/ftle/paraview_plugin/small_blf_day_loc1_4m_xy_N04.003.nc"])
+    @smproperty.stringvector(name="PalmFile", number_of_elements=1, default_values=[""])
     @smdomain.filelist()
     @smhint.filechooser(extensions="nc", file_description="NetCDF files")
     def SetPalmFile(self, value):
-        # ParaView may pass a string or a list
-        if isinstance(value, (list, tuple)):
-            self.palmfile = value[0] if value else ""
-        else:
-            self.palmfile = value
+        self.palmfile = value
         self.Modified()
 
     # scalar is a one element vector
@@ -291,6 +287,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
         # --------------------------------------------------------------
         res = dict()
         for name, var in nc.variables.items():
+            # velocity field names are inferred, they shuld start with u, v and w
             if re.match(r'^u', name) and getattr(var, 'units', '') == 'm/s':
                 # u velocity detected
                 res['u'] = name
@@ -304,7 +301,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
             raise ValueError("Failed to find v velocity")
         if 'w' not in res:
             raise ValueError("Failed to find w velocity")
-        # get the axes
+        # get the axes, assume the dimensions to be (time, z, y, x)
         if len(nc.variables[ res['u'] ].shape) != 4:
             raise ValueError(f"Wrong number of axes in u velocity, should be 4 but got {len(nc.variables[ res['u'] ].shape)}")
         res['x'] = nc.variables[ res['u'] ].dimensions[-1]
