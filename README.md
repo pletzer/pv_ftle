@@ -8,6 +8,7 @@ You must have the following installed:
  * Paraview (tested 6.0.1)
  * a C++ compiler (tested Apple clang version 17.0.0)
  * CMake (tested 4.1.2)
+ * Use the same Python version as that of Paraview, creating a conda environment if need be
 
 
 ## Building the Paraview PalFtleSource plugin
@@ -21,7 +22,7 @@ Start by building `pybind11`, making to sure to use the same python version as P
 ```Bash
 git clone https://github.com/pybind/pybind11.git
 cd pybind11
-cd pip install -e .
+pip install -e .
 cd ..
 ```
 
