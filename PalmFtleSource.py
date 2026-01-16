@@ -288,12 +288,12 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
         res = dict()
         for name, var in nc.variables.items():
             # velocity field names are inferred, they shuld start with u, v and w
-            if re.match(r'^u', name) and getattr(var, 'units', '') == 'm/s':
+            if re.match(r'^[Uu]', name) and (getattr(var, 'units', '') == 'm/s' or getattr(var, 'units', '') == 'm s-1'):
                 # u velocity detected
                 res['u'] = name
-            elif re.match(r'^v', name) and getattr(var, 'units', '') == 'm/s':
+            elif re.match(r'^[Vv]', name) and (getattr(var, 'units', '') == 'm/s' or getattr(var, 'units', '') == 'm s-1'):
                 res['v'] = name
-            elif re.match(r'^w', name) and getattr(var, 'units', '') == 'm/s':
+            elif re.match(r'^[Ww]', name) and (getattr(var, 'units', '') == 'm/s' or getattr(var, 'units', '') == 'm s-1'):
                 res['w'] = name
         if 'u' not in res:
             raise ValueError("Failed to find u velocity")
