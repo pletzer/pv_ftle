@@ -11,7 +11,7 @@ plugin_dir = os.path.dirname(globals().get("__file__", os.getcwd()))
 sys.path.insert(0, plugin_dir)
 
 # C++ extensions
-import ftlecpp
+from pv_ftle import _ftlecpp as ftlecpp
 
 try:
     # paraview 6.x
@@ -463,8 +463,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(verbose=False)
 
     return p
-
- 
 
 
 def cli():

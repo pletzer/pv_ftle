@@ -2,7 +2,9 @@
 #include <pybind11/numpy.h>
 #include <algorithm>
 #include <vector>
+#ifdef HAVE_OMP
 #include <omp.h> // Include OpenMP for parallelization
+#endif
 #include <cstdio>
 
 namespace py = pybind11;
@@ -116,11 +118,13 @@ py::array_t<double> integrate_rk4(
     if (xyz0.ndim() != 1 || xyz0.shape(0) % 3 != 0)
         throw std::runtime_error("xyz0 must be flat array of length 3*N");
     
+    #ifdef HAVE_OMP
     #pragma omp parallel
     {
         #pragma omp single
         printf("Running with %d threads\n", omp_get_num_threads());
     }
+    #endif
 
     auto xyz_ptr0 = xyz0.unchecked<1>();
     size_t n = xyz_ptr0.shape(0) / 3;
@@ -180,7 +184,7 @@ py::array_t<double> integrate_rk4(
 // -----------------------------------------------------------------------------
 // Pybind11 module
 // -----------------------------------------------------------------------------
-PYBIND11_MODULE(ftlecpp, m) {
+PYBIND11_MODULE(_ftlecpp, m) {
     m.def("integrate_rk4", &integrate_rk4,
           py::arg("xyz0"),
           py::arg("t0"),
