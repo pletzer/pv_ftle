@@ -3,7 +3,7 @@ import netCDF4
 import vtk
 import time
 import re
-import defopt
+import argparse
 
 # so that Python sees the shared libraries
 import sys, os
@@ -97,7 +97,7 @@ class PalmFtle:
         self.frozen = False
         self.checksum = True
 
-        self.verbose = 0
+        self.verbose = False
 
 
     def select_time_window(self, dt: float, nt: int) -> tuple:
@@ -342,7 +342,7 @@ time eigenvalue:  {tm5 - tm4:.3f} sec
                 ftle=ftle,
             )
 
-def main(*, palmfile: str='', vtkout: str='palm_ftel.vtr', tintegr:float=-10, cfl:float=0.25, 
+def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cfl:float=0.25, 
          imin: int=1, imax: int=-2, jmin: int=1, jmax: int=-2, 
          time_index: int=0, frozen: bool=False, checksum: bool=False, verbose: bool=False):
     """
@@ -372,6 +372,7 @@ def main(*, palmfile: str='', vtkout: str='palm_ftel.vtr', tintegr:float=-10, cf
     pf.time_index = time_index
     pf.frozen = frozen
     pf.checksum = checksum
+    pf.verbose = verbose
 
     res = pf.compute_ftle()
 
@@ -410,6 +411,80 @@ def main(*, palmfile: str='', vtkout: str='palm_ftel.vtr', tintegr:float=-10, cf
     writer.Update()
 
 
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Compute Finite-Time Lyapunov Exponent (FTLE) from a PALM file and write a VTK RectilinearGrid (.vtr)."
+    )
+
+    # Required positional: PALM NetCDF
+    p.add_argument(
+        "palmfile",
+        help="Path to PALM NetCDF file with velocity data."
+    )
+
+    # Optional outputs / numerics
+    p.add_argument("--vtkout", default="palm_ftel.vtr",
+                   help="Output VTK .vtr file (default: %(default)s)")
+    p.add_argument("--tintegr", type=float, default=-10.0,
+                   help="Integration time (default: %(default)s)")
+    p.add_argument("--cfl", type=float, default=0.25,
+                   help="CFL stability condition < 1 (default: %(default)s)")
+
+    # Window indices
+    p.add_argument("--imin", type=int, default=1, help="Min x index of window (default: %(default)s)")
+    p.add_argument("--imax", type=int, default=-2, help="Max x index of window (default: %(default)s)")
+    p.add_argument("--jmin", type=int, default=1, help="Min y index of window (default: %(default)s)")
+    p.add_argument("--jmax", type=int, default=-2, help="Max y index of window (default: %(default)s)")
+
+    # Time selection
+    p.add_argument("--time-index", type=int, default=0,
+                   help="Time index to select (default: %(default)s)")
+
+    # Booleans: provide --frozen/--no-frozen, --checksum/--no-checksum, --verbose/--quiet
+    g_frozen = p.add_mutually_exclusive_group()
+    g_frozen.add_argument("--frozen", dest="frozen", action="store_true",
+                          help="Freeze velocity during trajectories.")
+    g_frozen.add_argument("--no-frozen", dest="frozen", action="store_false",
+                          help="Do not freeze velocity (default).")
+    p.set_defaults(frozen=False)
+
+    g_checksum = p.add_mutually_exclusive_group()
+    g_checksum.add_argument("--checksum", dest="checksum", action="store_true",
+                            help="Compute checksum.")
+    g_checksum.add_argument("--no-checksum", dest="checksum", action="store_false",
+                            help="Do not compute checksum (default).")
+    p.set_defaults(checksum=False)
+
+    g_verbose = p.add_mutually_exclusive_group()
+    g_verbose.add_argument("--verbose", dest="verbose", action="store_true",
+                           help="Print diagnostics.")
+    g_verbose.add_argument("--quiet", dest="verbose", action="store_false",
+                           help="Suppress diagnostics (default).")
+    p.set_defaults(verbose=False)
+
+    return p
+
+ 
+
+
+def cli():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Call the logic
+    main(
+        palmfile=args.palmfile,
+        vtkout=args.vtkout,
+        tintegr=args.tintegr,
+        cfl=args.cfl,
+        imin=args.imin, imax=args.imax,
+        jmin=args.jmin, jmax=args.jmax,
+        time_index=args.time_index,
+        frozen=args.frozen,
+        checksum=args.checksum,
+        verbose=args.verbose,
+    )
+
 
 if __name__ == '__main__':
-    defopt.run(main)
+    cli()
