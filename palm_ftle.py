@@ -343,7 +343,7 @@ time eigenvalue:  {tm5 - tm4:.3f} sec
             )
 
 def main(*, palmfile: str='', vtkout: str='palm_ftel.vtr', tintegr:float=-10, cfl:float=0.25, 
-         imin: int=0, imax: int=-1, jmin: int=0, jmax: int=-1, 
+         imin: int=1, imax: int=-2, jmin: int=1, jmax: int=-2, 
          time_index: int=0, frozen: bool=False, checksum: bool=False, verbose: bool=False):
     """
     Compute the Finite Time Lyapunov Exponent
@@ -375,8 +375,40 @@ def main(*, palmfile: str='', vtkout: str='palm_ftel.vtr', tintegr:float=-10, cf
 
     res = pf.compute_ftle()
 
-    # save data
-    # TO DO 
+    # create a VTK rectilinear grid
+    rgrid = vtk.vtkRectilinearGrid()
+    x, y, z = res['x'], res['y'], res['z']
+    rgrid.SetDimensions(len(x), len(y), len(z))
+    x_arr = numpy_support.numpy_to_vtk(num_array=x, deep=True, array_type=vtk.VTK_DOUBLE)
+    y_arr = numpy_support.numpy_to_vtk(num_array=y, deep=True, array_type=vtk.VTK_DOUBLE)
+    z_arr = numpy_support.numpy_to_vtk(num_array=z, deep=True, array_type=vtk.VTK_DOUBLE)
+    rgrid.SetXCoordinates(x_arr)
+    rgrid.SetYCoordinates(y_arr)
+    rgrid.SetZCoordinates(z_arr)
+
+    # ---- FTLE is cell-centered and currently in (z, y, x) ----
+    # Convert to (x, y, z)
+    ftle_xyz = res['ftle'].transpose((2, 1, 0)).astype(np.float32)  # (nx-1, ny-1, nz-1)
+
+    # VTK expects Fortran order: x fastest, then y, then z
+    vtk_arr = numpy_support.numpy_to_vtk(
+        num_array=ftle_xyz.ravel(order='F'),   # x fastest, then y, then z
+        deep=True,
+        array_type=vtk.VTK_FLOAT
+    )
+    vtk_arr.SetName("FTLE")
+
+    cd = rgrid.GetCellData()
+    cd.AddArray(vtk_arr)
+    cd.SetScalars(vtk_arr)  # make FTLE the active cell scalar
+
+    # save the FTLE data
+    writer = vtk.vtkXMLRectilinearGridWriter()
+    writer.SetFileName(vtkout)
+    writer.SetDataModeToBinary()
+    writer.SetInputData(rgrid)
+    writer.Update()
+
 
 
 if __name__ == '__main__':
