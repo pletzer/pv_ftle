@@ -168,7 +168,7 @@ class PalmFtle:
 
             tm0 = time.perf_counter()
 
-            fld = self._get_nc_names(nc)
+            fld = self.get_nc_names(nc)
 
             if self.verbose:
                 print(f'self.imin={self.imin} self.imax={self.imax} self.jmin={self.jmin} self.jmax={self.jmax}')
