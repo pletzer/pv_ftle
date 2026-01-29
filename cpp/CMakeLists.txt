@@ -41,6 +41,9 @@ endif()
 # ------------------------
 # Build the pybind11 module
 # ------------------------
+# Use modern Python discovery with pybind11
+set(PYBIND11_FINDPYTHON ON)
+cmake_policy(SET CMP0148 NEW)
 pybind11_add_module(_ftlecpp ftlecpp.cpp)
 
 # Link OpenMP if found
@@ -51,6 +54,7 @@ endif()
 # ------------------------
 # Install
 # ------------------------
+cmake_policy(SET CMP0177 NEW)
 install(TARGETS _ftlecpp
     LIBRARY DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/../src/pv_ftle"
 )

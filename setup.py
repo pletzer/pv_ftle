@@ -4,6 +4,11 @@ import subprocess
 from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 
+if sys.platform == "darwin":
+    # to remove some warnings on Apple
+    os.environ["MACOSX_DEPLOYMENT_TARGET"] = "15.0"
+
+
 class CMakeExtension(Extension):
     def __init__(self, name, sourcedir=""):
         super().__init__(name, sources=[])
