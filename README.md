@@ -1,5 +1,40 @@
 # pv_ftle
 
+This repository provides a ParaView plugin and a command-line tool to compute the
+**finite-time Lyapunov exponent (FTLE)** from simulation data produced by the
+**PALM** model.
+
+PALM uses a **staggered C-grid discretization** for the velocity field, where the
+velocity components \(u, v, w\) are defined on cell faces rather than at cell
+centers.
+
+In contrast to many existing FTLE implementations, the method implemented here
+uses a **mimetic interpolation scheme** for the velocity field that respects the
+staggering of the velocity components, resulting in improved consistency and
+accuracy.
+
+---
+
+## Prerequisites
+
+- Python (ABI-compatible with the Python version used by ParaView)
+- A C++ compiler (e.g. `g++` or `clang++`)
+- CMake ≥ 3.12
+
+---
+
+## Environment
+
+We recommend working in a dedicated environment, either via **conda** or a
+**Python virtual environment**.
+
+To create and activate a virtual environment:
+
+```sh
+python -m venv venv
+source venv/bin/activate
+# pv_ftle
+
 A repository for a Paraview plugin that compute the finite time Lyapunov exponent (FTLE) from PALM code simulation data. PALM uses a C-grid discreatization for the velocity field, i.e. the u, v, w components are attached to cell faces. 
 
 In contrast to other implementations, the FTLE computation implemented here applies a mimetic interpolation method for the velocity field, which respects the staggering of the velocity components.
