@@ -35,6 +35,11 @@ setup(
     version="0.1.0",
     packages=find_packages("src"),
     package_dir={"": "src"},
+    entry_points={
+        "console_scripts": [
+            "palm_ftle=pv_ftle.palm_ftle:cli",
+        ]
+    },
     ext_modules=[CMakeExtension("pv_ftle._ftlecpp", sourcedir="cpp")],
     cmdclass={"build_ext": CMakeBuild},
     install_requires=[
