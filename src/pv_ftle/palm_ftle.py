@@ -1,6 +1,6 @@
 import numpy as np
 import netCDF4
-import vtk
+from vtk import (vtkRectilinearGrid, VTK_FLOAT, vtkXMLRectilinearGridWriter)
 import time
 import re
 import argparse
@@ -377,12 +377,12 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     res = pf.compute_ftle()
 
     # create a VTK rectilinear grid
-    rgrid = vtk.vtkRectilinearGrid()
+    rgrid = vtkRectilinearGrid()
     x, y, z = res['x'], res['y'], res['z']
     rgrid.SetDimensions(len(x), len(y), len(z))
-    x_arr = numpy_support.numpy_to_vtk(num_array=x, deep=True, array_type=vtk.VTK_DOUBLE)
-    y_arr = numpy_support.numpy_to_vtk(num_array=y, deep=True, array_type=vtk.VTK_DOUBLE)
-    z_arr = numpy_support.numpy_to_vtk(num_array=z, deep=True, array_type=vtk.VTK_DOUBLE)
+    x_arr = numpy_support.numpy_to_vtk(num_array=x, deep=True, array_type=VTK_FLOAT)
+    y_arr = numpy_support.numpy_to_vtk(num_array=y, deep=True, array_type=VTK_FLOAT)
+    z_arr = numpy_support.numpy_to_vtk(num_array=z, deep=True, array_type=VTK_FLOAT)
     rgrid.SetXCoordinates(x_arr)
     rgrid.SetYCoordinates(y_arr)
     rgrid.SetZCoordinates(z_arr)
@@ -395,7 +395,7 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     vtk_arr = numpy_support.numpy_to_vtk(
         num_array=ftle_xyz.ravel(order='F'),   # x fastest, then y, then z
         deep=True,
-        array_type=vtk.VTK_FLOAT
+        array_type=VTK_FLOAT
     )
     vtk_arr.SetName("FTLE")
 
@@ -404,7 +404,7 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     cd.SetScalars(vtk_arr)  # make FTLE the active cell scalar
 
     # save the FTLE data
-    writer = vtk.vtkXMLRectilinearGridWriter()
+    writer = vtkXMLRectilinearGridWriter()
     writer.SetFileName(vtkout)
     writer.SetDataModeToBinary()
     writer.SetInputData(rgrid)
