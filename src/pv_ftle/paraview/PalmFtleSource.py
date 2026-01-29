@@ -41,9 +41,6 @@ import sys, os
 plugin_dir = os.path.dirname(globals().get("__file__", os.getcwd()))
 sys.path.insert(0, plugin_dir)
 
-# C++ extensions
-import ftlecpp
-
 try:
     # paraview 6.x
     from vtkmodules.util import numpy_support
