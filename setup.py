@@ -1,7 +1,5 @@
 import os
-import re
 import sys
-import platform
 import subprocess
 from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext

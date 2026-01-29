@@ -4,28 +4,26 @@ A repository for Paraview plugins that compute the finite time Lyapunov exponent
 
 ## Prerequisites
 
- - Python (version compatible with that of Paraview)
+ - Python, whose version should be compatible with that of Paraview
  - A C++ compiler (e.g. g++)
  - CMake 3.12 or later
 
 ## Environment
 
-We recommend to work in a dedicated environment, either conda or a virtual environment. If invoking through a Paraview plugin 
-(see below), be sure to use the same Python version as that of Paraview. 
+We recommend to work in a dedicated environment, either conda or a virtual environment.
 
 To create a virtual environment:
 ```sh
 python -m venv venv
-pip install -r requirements.txt
 source venv/bin/activate
 ```
-(Type `deactive` to deactivate the environment.)
+(Type `deactive` to deactivate the environment when you're finished.)
 
 ## How to install the pv_ftle package
 
 In this directory, 
 ```sh
-pip install -e .
+pip install .
 ```
 
 ## How to test the package
@@ -42,7 +40,7 @@ for PALM file `small_blf_day_loc1_4m_xy_N04.003.nc`. This will save the FTLE dat
 
 ### Setting the number of threads
 
-By default, the application will use all the cores available. Use the `OMP_NUM_THREADS` to control the number of parallel threads, e.g.:
+By default, the application will use all the cores available on your computer. Use the `OMP_NUM_THREADS` to control the number of parallel threads, e.g.:
 ```sh
 OMP_NUM_THREADS=4 palm_ftle small_blf_day_loc1_4m_xy_N04.003.nc --imin=100 --imax=200 --jmin=300 --jmax=400 --tintegr=10 --time-index=10 --vtkout=ftle.vtr 
 ```
@@ -60,10 +58,27 @@ The table below shows the effect of `OMP_NUM_THREADS` for `i=100:400`, `j=100:40
 
 ## How to invoke the Paraview plugin
 
-Start Paraview. Opetionally, `export OMP_NUM_THREADS=8` (or some other number of threads). Then under 
- * `Tools` -> `Manage Plugins...`
- * then press `Load New`, navigate to the directory where `PalmFtleSource.py` resides. Click on `PalmFtleSource.py` and press `OK`.  
- * Wait for a few seconds, giving Paraview the time to load the plugin. Then close the `Plugin Manager` window. (It is critical to close the window otherwise the plugin will not be
-loaded.)
+Start Paraview. Point 
+```sh
+export PYTHONPATH=venv/lib/python3.12/site-packages
+```
+to the location where `pf_ftle` was installed. 
 
+Additionally, consider setting the number of threads with (for instance)
+```sh
+export OMP_NUM_THREADS=8
+```
 
+Then to load the plugin, launch `paraview`. 
+ * In the menu `Tools` select `Manage Plugins...`
+ * Press `Load New`, navigate to the directory where `PalmFtleSource.py` resides (e.g. 
+ `venv/lib/python3.12/site-packages/pv_ftle/paraview`)
+ * Click on `PalmFtleSource.py` and press `OK`. Wait for a few seconds, giving Paraview the time to load the plugin. 
+ * Close the `Plugin Manager` window. (critical otherwise the plugin will not be loaded)
+ * The plugin will appaear under the `Source` -> `Alphabetical` -> `PALM FTLE Source` 
+
+Setting
+```sh
+export PV_PLUGIN_PATH=venv/lib/python3.12/site-packages/pv_ftle/paraview
+```
+will automatically load the plugin each time you launch Paraview.
