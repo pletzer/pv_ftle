@@ -64,18 +64,18 @@ The table below shows the effect of `OMP_NUM_THREADS` for `i=100:400`, `j=100:40
 
 The computation of the finite time Lypunov exponent can be performed within Paraview using a source plugin. The plugin must have been installed with `pip install .`. 
 
-Start Paraview. Point 
+To enable Paraview to find the `pv_ftle` package, point 
 ```sh
-export PYTHONPATH=venv/lib/python3.12/site-packages
+export PYTHONPATH=<path/to/>venv/lib/python3.12/site-packages
 ```
-to the location where `pf_ftle` was installed. 
+to the location where `pf_ftle` was installed. (Adapt as required.)
 
 Additionally, consider setting the number of threads with (for instance)
 ```sh
 export OMP_NUM_THREADS=8
 ```
 
-Then to load the plugin, launch `paraview`. 
+Start Paraview. Then to load the plugin:
  * In the menu `Tools` select `Manage Plugins...`
  * Press `Load New`, navigate to the directory where `PalmFtleSource.py` resides (e.g. 
  `venv/lib/python3.12/site-packages/pv_ftle/paraview`)
