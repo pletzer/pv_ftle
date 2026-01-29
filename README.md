@@ -85,6 +85,6 @@ Start Paraview. Then to load the plugin:
 
 Setting
 ```sh
-export PV_PLUGIN_PATH=venv/lib/python3.12/site-packages/pv_ftle/paraview
+export PV_PLUGIN_PATH=<path/to>/venv/lib/python3.12/site-packages/pv_ftle/paraview
 ```
-will automatically load the plugin each time you launch Paraview.
+will automatically load the plugin each time you launch Paraview. (Adapt as required.)
