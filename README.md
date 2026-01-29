@@ -1,95 +1,48 @@
 # pv_ftle
 
-A repository for Paraview plugins that compute the finite time Lyapunov exponent (FTLE) 
+A repository for Paraview plugins that compute the finite time Lyapunov exponent (FTLE)
 
-## Requirements
+## Prerequisites
 
-You must have the following installed:
- * Paraview (tested 6.0.1)
- * a C++ compiler (tested Apple clang version 17.0.0)
- * CMake (tested 4.1.2)
- * Use the same Python version as that of Paraview, creating a conda environment if need be
+ - Python, whose version should be compatible with that of Paraview
+ - A C++ compiler (e.g. g++)
+ - CMake 3.12 or later
 
-We recommed to build in a virtual environment with the dependecies installed
-```
-python -m venv venv 
+## Environment
+
+We recommend to work in a dedicated environment, either conda or a virtual environment.
+
+To create a virtual environment:
+```sh
+python -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt 
+```
+(Type `deactive` to deactivate the environment when you're finished.)
+
+## How to install the pv_ftle package
+
+In this directory, 
+```sh
+pip install .
 ```
 
+## How to test the package
 
-## Building the Paraview PalFtleSource plugin
-
-This directory contains a Paraview plugin `PalmFtleSource.py`, which computes the finite time Lyapunov exponent for a velocity field on a Arakawa C-grid.
-
-This Python plugin calls C++ code that needs to be compiled. The plugin uses `pybind11` to extend Python with C++. 
-
-In the root `pv_ftle` directory, start by building `pybind11`, making to sure to use the same python version as Paraview.
-
-```Bash
-git clone https://github.com/pybind/pybind11.git
-cd pybind11
-pip install -e .
-cd ..
+Type
+```sh
+palm_ftle -h
 ```
-
-The steps to build the plugin were tested on Mac OS X with Paraview 6.0.1.
-
-### On MAC OS X
-
-We recommend to install Paraview and Python with brew, which will ensure that both are consistent. To build the shared library
-
-```bash
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make
+to see the full list of options. Example:
+```sh
+palm_ftle small_blf_day_loc1_4m_xy_N04.003.nc --imin=100 --imax=200 --jmin=300 --jmax=400 --tintegr=10 --time-index=10 --vtkout=ftle.vtr --checksum --verbose
 ```
-Now you should have a shared library `ftlecpp.cpython-312-darwin.so` (the name will change depending on 
-platform). Copy this file to the root directory, i.e. next to `PalmFtleSource.py` file.
-```bash
-cp ftlecpp.cpython-312-darwin.so ..
-```
+for PALM file `small_blf_day_loc1_4m_xy_N04.003.nc`. This will save the FTLE data in file `ftle.vtr`. 
 
-### On Linux
+### Setting the number of threads
 
-The steps should be similar to those on Mac OS X. You might need to set `PYTHON_EXECUTABLE` and be use the same compiler that was used to build Paraview. 
-
-
-## How to load the plugin
-
-Start Paraview. Under 
- * `Tools` -> `Manage Plugins...`
- * then press `Load New`, navigate to the directory where `PalmFtleSource.py` resides. Click on `PalmFtleSource.py` and press `OK`.  
- * Wait for a few seconds, giving Paraview the time to load the plugin. Then close the `Plugin Manager` window. (It is critical to close the window otherwise the plugin will not be
-loaded.)
-
-Note: to automatically load the plugin when starting ParaView, set
-```
-export PV_PLUGIN_PATH=/path/to/plugin
-```
-
-## How to invoke the plugin
-
-Go to `Sources` and select `PALM FTLE Source` under the `Alphabetical` menu. Select the `Palm file` in the menu; this is the PALM NetCDF output file that contains the velocity field. Then press `Apply`. Change "Solid Color" to "FTLE" and "Outline" to "Surface".
-
-## Volume rendering
-
-The FTLE field is cell centred and on a rectlinear grid, therefore selecting `Volume` will not work. However, one can apply the follwoing filters to turn the FTLE into point image data:
- * add a `Cell to Point Data` filter
- * and connecting to to a `Resample to Image` filter, then use `Volume` to see the interior.  
-
-## Using multiple threads
-
-The computation of FTLE is compute intensive. Running with multiple OpenMP threads can reduce the execution time. 
-
-To run with multiple threads, 
-```
-export OMP_NUM_THREADS=4
-```
-(or set to any number of threads), prior to launching Paraview:
-```bash
-paraview &
+By default, the application will use all the cores available on your computer. Use the `OMP_NUM_THREADS` to control the number of parallel threads, e.g.:
+```sh
+OMP_NUM_THREADS=4 palm_ftle small_blf_day_loc1_4m_xy_N04.003.nc --imin=100 --imax=200 --jmin=300 --jmax=400 --tintegr=10 --time-index=10 --vtkout=ftle.vtr 
 ```
 
 The table below shows the effect of `OMP_NUM_THREADS` for `i=100:400`, `j=100:400` and an integration time of -10 on a MacBook Air laptop (M4). The maximum speedup is 2.7.
@@ -103,3 +56,29 @@ The table below shows the effect of `OMP_NUM_THREADS` for `i=100:400`, `j=100:40
 | 6                  |   24.9       |
 
 
+## How to invoke the Paraview plugin
+
+Start Paraview. Point 
+```sh
+export PYTHONPATH=venv/lib/python3.12/site-packages
+```
+to the location where `pf_ftle` was installed. 
+
+Additionally, consider setting the number of threads with (for instance)
+```sh
+export OMP_NUM_THREADS=8
+```
+
+Then to load the plugin, launch `paraview`. 
+ * In the menu `Tools` select `Manage Plugins...`
+ * Press `Load New`, navigate to the directory where `PalmFtleSource.py` resides (e.g. 
+ `venv/lib/python3.12/site-packages/pv_ftle/paraview`)
+ * Click on `PalmFtleSource.py` and press `OK`. Wait for a few seconds, giving Paraview the time to load the plugin. 
+ * Close the `Plugin Manager` window. (critical otherwise the plugin will not be loaded)
+ * The plugin will appaear under the `Source` -> `Alphabetical` -> `PALM FTLE Source` 
+
+Setting
+```sh
+export PV_PLUGIN_PATH=venv/lib/python3.12/site-packages/pv_ftle/paraview
+```
+will automatically load the plugin each time you launch Paraview.

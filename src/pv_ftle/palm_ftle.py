@@ -1,39 +1,9 @@
-"""
-Custom ParaView Python Source plugin to read PALM Netcdf data and compute the 
-Finite Time Lyapunov Exponent 
-
-This version allows the velocity field to either be frozen in time or vary 
- as the grid point trajectories are being integrated. 
-
-Inputs:
-  - palmfile: path to a NetCDF file
-  - tintegr: integration time (float)
-  - imin, imax: x-index bounds for the seeds
-  - jmin, jmax: y-index bounds
-  - tindex: time index
-
-Reads fields:
-  - u, v, w
-
-Grid:
-  - Assumed 3D rectilinear, cell-centred output
-  - Index order assumed (time, k, j, i) = (time, nz, ny, nx)
-  - x and y spacing assumed uniform; z spacing can be nonuniform.
-"""
-
-from paraview.util.vtkAlgorithm import (
-    VTKPythonAlgorithmBase,
-    smproxy,
-    smproperty,
-    smdomain,
-    smhint,
-)
 import numpy as np
 import netCDF4
-from vtkmodules.vtkCommonDataModel import vtkRectilinearGrid, vtkMultiBlockDataSet
-import vtk
+from vtk import (vtkRectilinearGrid, VTK_FLOAT, vtkXMLRectilinearGridWriter)
 import time
 import re
+import argparse
 
 # so that Python sees the shared libraries
 import sys, os
@@ -41,7 +11,7 @@ plugin_dir = os.path.dirname(globals().get("__file__", os.getcwd()))
 sys.path.insert(0, plugin_dir)
 
 # C++ extensions
-import ftlecpp
+from pv_ftle import _ftlecpp as ftlecpp
 
 try:
     # paraview 6.x
@@ -53,7 +23,9 @@ except:
 # -------------------------
 # RK4 step estimate (CFL-like)
 # -------------------------
-def _estimate_nsteps(uface, vface, wface, dx, dy, dz, cfl, T, min_steps=20):
+def estimate_nsteps(uface: np.ndarray, vface: np.ndarray, wface: np.ndarray, 
+                    dx: float, dy: float, dz: np.ndarray, cfl: float, T: float, 
+                    min_steps: int=20):
     """
     Estimate number of RK4 steps using a CFL-like heuristic:
     nsteps ~ (Umax * |T| / hmin) / cfl
@@ -68,7 +40,7 @@ def _estimate_nsteps(uface, vface, wface, dx, dy, dz, cfl, T, min_steps=20):
 # -------------------------------------
 # Cell centred gradient from point data
 # -------------------------------------
-def _gradient_corner_to_center(Xf: np.ndarray, dx: float, dy: float, dz: np.ndarray) -> np.ndarray:
+def gradient_corner_to_center(Xf: np.ndarray, dx: float, dy: float, dz: np.ndarray) -> np.ndarray:
     """
     Cell-centred gradients for a field defined at cell corners.
     Xf has shape (nz+1, ny+1, nx+1) = (k, j, i).
@@ -109,18 +81,9 @@ def _gradient_corner_to_center(Xf: np.ndarray, dx: float, dy: float, dz: np.ndar
     return dXdx, dXdy, dXdz
 
 
-@smproxy.source(
-    name="PalmFtleSource",
-    label="PALM FTLE Source",
-)
-class PalmFtleSource(VTKPythonAlgorithmBase):
+class PalmFtle:
 
     def __init__(self):
-        VTKPythonAlgorithmBase.__init__(self,
-            nInputPorts=0,
-            nOutputPorts=1,
-            outputType='vtkMultiBlockDataSet' # vtkImageData cannot be used because it needs the extent known ahead of time
-        )
 
         # ---- user parameters (with defaults) ----
         self.palmfile = ""
@@ -134,127 +97,9 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
         self.frozen = False
         self.checksum = True
 
-        self.verbose = 0
-
-    # ------------------------------------------------------------------
-    # Properties exposed to ParaView GUI
-    # ------------------------------------------------------------------
-
-    @smproperty.stringvector(name="PalmFile", number_of_elements=1, default_values=[""])
-    @smdomain.filelist()
-    @smhint.filechooser(extensions="nc", file_description="NetCDF files")
-    def SetPalmFile(self, value):
-        self.palmfile = value
-        self.Modified()
-
-    # scalar is a one element vector
-    @smproperty.doublevector(name="IntegrationTime", number_of_elements=1, default_values=[-10.0])
-    def SetIntegrationTime(self, value):
-        self.tintegr = float(value)
-        self.Modified()
-
-    @smproperty.intvector(name="TimeIndex", number_of_elements=1, default_values=[10])
-    def SetTimeIndex(self, value):
-        self.time_index = int(value)
-        self.Modified()
-
-    @smproperty.doublevector(name="Cfl", number_of_elements=1, default_values=[0.25])
-    def SetCfl(self, value):
-        self.cfl = float(value)
-        self.Modified()
-
-    @smproperty.intvector(name="Frozen", number_of_elements=1, default_values=[0])
-    def SetFrozen(self, value):
-        self.frozen = bool(value)
-        self.Modified()
-
-    @smproperty.intvector(name="Verbose", number_of_elements=1, default_values=[0])
-    def SetVerbose(self, value):
-        self.verbose = bool(value)
-        self.Modified()
-
-    @smproperty.intvector(
-        name="IRange",
-        number_of_elements=2,
-        default_values=[180, 320]
-    )
-    def SetIRange(self, imin, imax):
-        """
-        Set the i-index range as a 2-element integer array [imin, imax].
-        """
-        self.imin = int(imin)
-        self.imax = int(imax)
-        self.Modified()
-
-    @smproperty.intvector(
-        name="JRange",
-        number_of_elements=2,
-        default_values=[180, 260]
-    )
-    def SetJRange(self, jmin, jmax):
-        """
-        Set the j-index range as a 2-element integer array [jmin, jmax].
-        """
-        self.jmin = int(jmin)
-        self.jmax = int(jmax)
-        self.Modified()
+        self.verbose = False
 
 
-    # ------------------------------------------------------------------
-    # Core pipeline method
-    # ------------------------------------------------------------------
-
-    def RequestData(self, request, inInfo, outInfo):
-
-        if not self.palmfile:
-            raise RuntimeError("PalmFile must be specified")
-
-        res = self._compute_ftle()
-
-        # Axes
-        x, y, z = res['x'], res['y'], res['z']
-
-        if self.verbose:
-            print(f'x = {x} y = {y} z = {z}')
-
-        # Number of nodes
-        nx1, ny1, nz1 = x.shape[0], y.shape[0], z.shape[0]
-
-        # Build image
-        grid = vtkRectilinearGrid()
-        grid.SetExtent(0, nx1-1, 0, ny1-1, 0, nz1-1)
-
-        # convert the numpy arrays to VTK arrays
-        x_arr = numpy_support.numpy_to_vtk(num_array=x, deep=True, array_type=vtk.VTK_DOUBLE)
-        y_arr = numpy_support.numpy_to_vtk(num_array=y, deep=True, array_type=vtk.VTK_DOUBLE)
-        z_arr = numpy_support.numpy_to_vtk(num_array=z, deep=True, array_type=vtk.VTK_DOUBLE)
-        grid.SetXCoordinates(x_arr)
-        grid.SetYCoordinates(y_arr)
-        grid.SetZCoordinates(z_arr)
-
-        # ---- FTLE is cell-centered and currently in (z, y, x) = (17, 80, 20) ----
-        # Convert to (x, y, z) = (20, 80, 17)
-        ftle_xyz = res['ftle'].transpose((2, 1, 0)).astype(np.float32)  # (nx-1, ny-1, nz-1)
-
-        # VTK expects Fortran order: x fastest, then y, then z
-        vtk_arr = numpy_support.numpy_to_vtk(
-            num_array=ftle_xyz.ravel(order='F'),   # x fastest, then y, then z
-            deep=True,
-            array_type=vtk.VTK_FLOAT
-        )
-        vtk_arr.SetName("FTLE")
-
-        cd = grid.GetCellData()
-        cd.AddArray(vtk_arr)
-        cd.SetScalars(vtk_arr)  # make FTLE the active cell scalar
-
-        # 3. Put it in the multi-block output
-        output = vtkMultiBlockDataSet.GetData(outInfo, 0)
-        output.SetNumberOfBlocks(1)
-        output.SetBlock(0, grid)
- 
-        return 1
-   
     def select_time_window(self, dt: float, nt: int) -> tuple:
         # --------------------------------------------------------------
         # Select the time window to read velocity data from
@@ -281,7 +126,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
 
         return tmin, tmax
     
-    def _get_nc_names(self, nc) -> dict:
+    def get_nc_names(self, nc) -> dict:
         # --------------------------------------------------------------
         # Get the field names for u, v, w, x, y, z
         # --------------------------------------------------------------
@@ -314,7 +159,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
 
         return res
 
-    def _compute_ftle(self) -> dict:
+    def compute_ftle(self) -> dict:
 
         # --------------------------------------------------------------
         # Read NetCDF data
@@ -323,7 +168,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
 
             tm0 = time.perf_counter()
 
-            fld = self._get_nc_names(nc)
+            fld = self.get_nc_names(nc)
 
             if self.verbose:
                 print(f'self.imin={self.imin} self.imax={self.imax} self.jmin={self.jmin} self.jmax={self.jmax}')
@@ -399,7 +244,7 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
             # [x..., y..., z...] positions.
             # Note: FTLE is computed from corner-seeded trajectories.
             xyz0 = np.concatenate([xflat, yflat, zflat]).astype(np.float64)
-            nsteps = _estimate_nsteps(uface, vface, wface, 
+            nsteps = estimate_nsteps(uface, vface, wface, 
                                       dx=dx, dy=dy, dz=dz.min(), 
                                       cfl=self.cfl, T=self.tintegr)
             if self.verbose:
@@ -448,9 +293,9 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
             Zf = xyz[2*n:3*n].reshape((nz1, ny1, nx1))
 
             # Compute the deformation gradient F at cell centres
-            f11, f12, f13 = _gradient_corner_to_center(Xf, dx, dy, dz)
-            f21, f22, f23 = _gradient_corner_to_center(Yf, dx, dy, dz)
-            f31, f32, f33 = _gradient_corner_to_center(Zf, dx, dy, dz)
+            f11, f12, f13 = gradient_corner_to_center(Xf, dx, dy, dz)
+            f21, f22, f23 = gradient_corner_to_center(Yf, dx, dy, dz)
+            f31, f32, f33 = gradient_corner_to_center(Zf, dx, dy, dz)
 
             # Cauchy-Green tensor components
             C = np.empty((nz, ny, nx, 3, 3), dtype=float)
@@ -496,3 +341,148 @@ time eigenvalue:  {tm5 - tm4:.3f} sec
                 x=xaxis, y=yaxis, z=zaxis, # axes
                 ftle=ftle,
             )
+
+def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cfl:float=0.25, 
+         imin: int=1, imax: int=-2, jmin: int=1, jmax: int=-2, 
+         time_index: int=0, frozen: bool=False, checksum: bool=False, verbose: bool=False):
+    """
+    Compute the Finite Time Lyapunov Exponent
+
+    @param palmfile PALM NetCDF file with velocity data
+    @param vtkout VTK output file
+    @param tintegr integration time
+    @param cfl stability condition when integrating the trajectories, should be < 1
+    @param imin min x index of window where FTLE will be computed
+    @param imax max x index of window where FTLE will be computed
+    @param jmin min y index of window where FTLE will be computed
+    @param jmax max y index of window where FTLE will be computed
+    @param time_index select time index
+    @param frozen whether to freeze the velocity while computing the trajectories
+    @param checksum whether to compute a checksum
+    @param verbose to print messages
+    """
+    pf = PalmFtle()
+    pf.palmfile = palmfile
+    pf.tintegr = tintegr
+    pf.cfl = cfl
+    pf.imin = imin
+    pf.imax = imax
+    pf.jmin = jmin
+    pf.jmax = jmax
+    pf.time_index = time_index
+    pf.frozen = frozen
+    pf.checksum = checksum
+    pf.verbose = verbose
+
+    res = pf.compute_ftle()
+
+    # create a VTK rectilinear grid
+    rgrid = vtkRectilinearGrid()
+    x, y, z = res['x'], res['y'], res['z']
+    rgrid.SetDimensions(len(x), len(y), len(z))
+    x_arr = numpy_support.numpy_to_vtk(num_array=x, deep=True, array_type=VTK_FLOAT)
+    y_arr = numpy_support.numpy_to_vtk(num_array=y, deep=True, array_type=VTK_FLOAT)
+    z_arr = numpy_support.numpy_to_vtk(num_array=z, deep=True, array_type=VTK_FLOAT)
+    rgrid.SetXCoordinates(x_arr)
+    rgrid.SetYCoordinates(y_arr)
+    rgrid.SetZCoordinates(z_arr)
+
+    # ---- FTLE is cell-centered and currently in (z, y, x) ----
+    # Convert to (x, y, z)
+    ftle_xyz = res['ftle'].transpose((2, 1, 0)).astype(np.float32)  # (nx-1, ny-1, nz-1)
+
+    # VTK expects Fortran order: x fastest, then y, then z
+    vtk_arr = numpy_support.numpy_to_vtk(
+        num_array=ftle_xyz.ravel(order='F'),   # x fastest, then y, then z
+        deep=True,
+        array_type=VTK_FLOAT
+    )
+    vtk_arr.SetName("FTLE")
+
+    cd = rgrid.GetCellData()
+    cd.AddArray(vtk_arr)
+    cd.SetScalars(vtk_arr)  # make FTLE the active cell scalar
+
+    # save the FTLE data
+    writer = vtkXMLRectilinearGridWriter()
+    writer.SetFileName(vtkout)
+    writer.SetDataModeToBinary()
+    writer.SetInputData(rgrid)
+    writer.Update()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Compute Finite-Time Lyapunov Exponent (FTLE) from a PALM file and write a VTK RectilinearGrid (.vtr)."
+    )
+
+    # Required positional: PALM NetCDF
+    p.add_argument(
+        "palmfile",
+        help="Path to PALM NetCDF file with velocity data."
+    )
+
+    # Optional outputs / numerics
+    p.add_argument("--vtkout", default="palm_ftel.vtr",
+                   help="Output VTK .vtr file (default: %(default)s)")
+    p.add_argument("--tintegr", type=float, default=-10.0,
+                   help="Integration time (default: %(default)s)")
+    p.add_argument("--cfl", type=float, default=0.25,
+                   help="CFL stability condition < 1 (default: %(default)s)")
+
+    # Window indices
+    p.add_argument("--imin", type=int, default=1, help="Min x index of window (default: %(default)s)")
+    p.add_argument("--imax", type=int, default=-2, help="Max x index of window (default: %(default)s)")
+    p.add_argument("--jmin", type=int, default=1, help="Min y index of window (default: %(default)s)")
+    p.add_argument("--jmax", type=int, default=-2, help="Max y index of window (default: %(default)s)")
+
+    # Time selection
+    p.add_argument("--time-index", type=int, default=0,
+                   help="Time index to select (default: %(default)s)")
+
+    # Booleans: provide --frozen/--no-frozen, --checksum/--no-checksum, --verbose/--quiet
+    g_frozen = p.add_mutually_exclusive_group()
+    g_frozen.add_argument("--frozen", dest="frozen", action="store_true",
+                          help="Freeze velocity during trajectories.")
+    g_frozen.add_argument("--no-frozen", dest="frozen", action="store_false",
+                          help="Do not freeze velocity (default).")
+    p.set_defaults(frozen=False)
+
+    g_checksum = p.add_mutually_exclusive_group()
+    g_checksum.add_argument("--checksum", dest="checksum", action="store_true",
+                            help="Compute checksum.")
+    g_checksum.add_argument("--no-checksum", dest="checksum", action="store_false",
+                            help="Do not compute checksum (default).")
+    p.set_defaults(checksum=False)
+
+    g_verbose = p.add_mutually_exclusive_group()
+    g_verbose.add_argument("--verbose", dest="verbose", action="store_true",
+                           help="Print diagnostics.")
+    g_verbose.add_argument("--quiet", dest="verbose", action="store_false",
+                           help="Suppress diagnostics (default).")
+    p.set_defaults(verbose=False)
+
+    return p
+
+
+def cli():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Call the logic
+    main(
+        palmfile=args.palmfile,
+        vtkout=args.vtkout,
+        tintegr=args.tintegr,
+        cfl=args.cfl,
+        imin=args.imin, imax=args.imax,
+        jmin=args.jmin, jmax=args.jmax,
+        time_index=args.time_index,
+        frozen=args.frozen,
+        checksum=args.checksum,
+        verbose=args.verbose,
+    )
+
+
+if __name__ == '__main__':
+    cli()
