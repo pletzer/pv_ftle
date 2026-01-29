@@ -33,27 +33,6 @@ To create and activate a virtual environment:
 ```sh
 python -m venv venv
 source venv/bin/activate
-# pv_ftle
-
-A repository for a Paraview plugin that compute the finite time Lyapunov exponent (FTLE) from PALM code simulation data. PALM uses a C-grid discreatization for the velocity field, i.e. the u, v, w components are attached to cell faces. 
-
-In contrast to other implementations, the FTLE computation implemented here applies a mimetic interpolation method for the velocity field, which respects the staggering of the velocity components.
-
-
-## Prerequisites
-
- - Python, whose version should be compatible with that of Paraview
- - A C++ compiler (e.g. g++)
- - CMake 3.12 or later
-
-## Environment
-
-We recommend to work in a dedicated environment, either conda or a virtual environment.
-
-To create a virtual environment:
-```sh
-python -m venv venv
-source venv/bin/activate
 ```
 (Type `deactivate` to deactivate the environment when you're finished.)
 
