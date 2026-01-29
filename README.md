@@ -2,7 +2,7 @@
 
 A repository for a Paraview plugin that compute the finite time Lyapunov exponent (FTLE) from PALM code simulation data. PALM uses a C-grid discreatization for the velocity field, i.e. the u, v, w components are attached to cell faces. 
 
-In contrast to other implementations, the FTLE computation implemented here applies a mimetic interpolation method for the velocity field, by respecting the staggering of the velocity components.
+In contrast to other implementations, the FTLE computation implemented here applies a mimetic interpolation method for the velocity field, which respects the staggering of the velocity components.
 
 
 ## Prerequisites
