@@ -1,6 +1,9 @@
 # pv_ftle
 
-A repository for Paraview plugins that compute the finite time Lyapunov exponent (FTLE)
+A repository for a Paraview plugin that compute the finite time Lyapunov exponent (FTLE) from PALM code simulation data. PALM uses a C-grid discreatization for the velocity field, i.e. the u, v, w components are attached to cell faces. 
+
+In contrast to other implementations, the FTLE computation implemented here applies a mimetic interpolation method for the velocity field, by respecting the staggering of the velocity components.
+
 
 ## Prerequisites
 
@@ -25,7 +28,7 @@ In this directory,
 ```sh
 pip install .
 ```
-(Note: do not use editable install, i.e. `pip install -e .`, as this create links. It's important to copy the files.)
+(Note: do not use editable install, i.e. `pip install -e .` when using the Paraview plugin, see below.)
 
 ## How to test the package
 
@@ -41,7 +44,7 @@ for PALM file `small_blf_day_loc1_4m_xy_N04.003.nc`. This will save the FTLE dat
 
 ### Setting the number of threads
 
-By default, the application will use all the cores available on your computer. Use the `OMP_NUM_THREADS` to control the number of parallel threads, e.g.:
+By default, the application will use all the cores available on your computer. Use `OMP_NUM_THREADS` to control the number of parallel threads, e.g.:
 ```sh
 OMP_NUM_THREADS=4 palm_ftle small_blf_day_loc1_4m_xy_N04.003.nc --imin=100 --imax=200 --jmin=300 --jmax=400 --tintegr=10 --time-index=10 --vtkout=ftle.vtr 
 ```
@@ -58,6 +61,8 @@ The table below shows the effect of `OMP_NUM_THREADS` for `i=100:400`, `j=100:40
 
 
 ## How to invoke the Paraview plugin
+
+The computation of the finite time Lypunov exponent can be performed within Paraview using a source plugin. The plugin must have been installed with `pip install .`. 
 
 Start Paraview. Point 
 ```sh
