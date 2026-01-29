@@ -34,7 +34,7 @@ from vtkmodules.vtkCommonDataModel import vtkRectilinearGrid, vtkMultiBlockDataS
 import vtk
 import time
 import re
-from palm_ftle import PalmFtle
+from pv_ftle.palm_ftle import PalmFtle
 
 # so that Python sees the shared libraries
 import sys, os
