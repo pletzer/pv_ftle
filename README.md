@@ -17,7 +17,7 @@ To create a virtual environment:
 python -m venv venv
 source venv/bin/activate
 ```
-(Type `deactive` to deactivate the environment when you're finished.)
+(Type `deactivate` to deactivate the environment when you're finished.)
 
 ## How to install the pv_ftle package
 
@@ -25,6 +25,7 @@ In this directory,
 ```sh
 pip install .
 ```
+(Note: do not use editable install, i.e. `pip install -e .`, as this create links. It's important to copy the files.)
 
 ## How to test the package
 
