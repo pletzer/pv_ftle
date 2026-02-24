@@ -31,7 +31,7 @@ def estimate_nsteps(uface: np.ndarray, vface: np.ndarray, wface: np.ndarray,
     nsteps ~ (Umax * |T| / hmin) / cfl
     with lower bound min_steps.
     """
-    speed2 = uface*uface + vface*vface + wface*wface
+    speed2 = uface*uface + vface*vface #+ wface*wface
     Umax = np.sqrt(np.nanmax(speed2))
     hmin = min(dx, dy, dz)
     crossings = Umax * abs(T) / hmin
@@ -149,6 +149,8 @@ class PalmFtle:
         # get the axes, assume the dimensions to be (time, z, y, x)
         if len(nc.variables[ res['u'] ].shape) != 4:
             raise ValueError(f"Wrong number of axes in u velocity, should be 4 but got {len(nc.variables[ res['u'] ].shape)}")
+        
+
         res['x'] = nc.variables[ res['u'] ].dimensions[-1]
         res['y'] = nc.variables[ res['v'] ].dimensions[-2]
         res['z'] = nc.variables[ res['w'] ].dimensions[-3]
@@ -182,6 +184,11 @@ class PalmFtle:
             xaxis = nc.variables[ fld['x'] ][self.imin:self.imax+1]
             yaxis = nc.variables[ fld['y'] ][self.jmin:self.jmax+1]
             zaxis = nc.variables[ fld['z'] ][:] # read all the elevations
+
+            # PALM WORKAROUND for some reason the first level is missing, so adding it 
+            dz1 = zaxis[1] - zaxis[0]
+            zaxis = np.concatenate(([zaxis[0] - dz1], zaxis))
+
             # full domain axes
             xaxis_full = nc.variables[ fld['x'] ][:]
             yaxis_full = nc.variables[ fld['y'] ][:]
@@ -230,6 +237,9 @@ class PalmFtle:
             wface = np.nan_to_num( 
                 nc.variables[ fld['w'] ][tmin:tmax, :, :, :], 
                 copy=False, nan=0.0)
+            
+            # PALM WORKAROUND add the first layer of w, setting all the values to 0
+            wface = np.concatenate((np.zeros(shape=(wface.shape[0], 1, wface.shape[2], wface.shape[3]), dtype=wface.dtype), wface), axis=1)
 
             tm1 = time.perf_counter()
 
