@@ -143,7 +143,11 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
         x, y, z = res['x'], res['y'], res['z']
 
         if self.pf.verbose:
-            print(f'x = {x} y = {y} z = {z}')
+            print(f'''
+x = {x}
+y = {y}
+z = {z}
+        ''')
 
         # Number of nodes
         nx1, ny1, nz1 = x.shape[0], y.shape[0], z.shape[0]

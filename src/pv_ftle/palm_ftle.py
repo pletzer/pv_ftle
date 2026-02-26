@@ -31,8 +31,14 @@ def estimate_nsteps(uface: np.ndarray, vface: np.ndarray, wface: np.ndarray,
     nsteps ~ (Umax * |T| / hmin) / cfl
     with lower bound min_steps.
     """
-    speed2 = uface*uface + vface*vface + wface*wface
-    Umax = np.sqrt(np.nanmax(speed2))
+    # number of cells
+    nz, ny, nx = uface.shape[-3], uface.shape[-2], vface.shape[-1]
+
+    speedSquare = uface[:, :nz, :ny, :nx] * uface[:, :nz, :ny, :nx] + \
+                  vface[:, :nz, :ny, :nx] * vface[:, :nz, :ny, :nx] + \
+                  wface[:, :nz, :ny, :nx] * wface[:, :nz, :ny, :nx]
+    Umax = np.sqrt(np.nanmax(speedSquare))
+
     hmin = min(dx, dy, dz)
     crossings = Umax * abs(T) / hmin
     return max(int(crossings / cfl) + 1, min_steps)
@@ -149,13 +155,24 @@ class PalmFtle:
         # get the axes, assume the dimensions to be (time, z, y, x)
         if len(nc.variables[ res['u'] ].shape) != 4:
             raise ValueError(f"Wrong number of axes in u velocity, should be 4 but got {len(nc.variables[ res['u'] ].shape)}")
+
+        # axes
         res['x'] = nc.variables[ res['u'] ].dimensions[-1]
         res['y'] = nc.variables[ res['v'] ].dimensions[-2]
         res['z'] = nc.variables[ res['w'] ].dimensions[-3]
         res['time'] = nc.variables[ res['w'] ].dimensions[-4]
 
         if self.verbose:
-            print(f'NetCDF variable names: u: {res["u"]} v: {res["v"]} w: {res["w"]} x: {res["x"]} y: {res["y"]} z: {res["z"]} time: {res["time"]}')
+            print(f'''
+NetCDF variable names:
+    u: {res["u"]}
+    v: {res["v"]}
+    w: {res["w"]}
+    x: {res["x"]}
+    y: {res["y"]}
+    z: {res["z"]}
+    time: {res["time"]}
+    ''')
 
         return res
 
@@ -211,6 +228,8 @@ class PalmFtle:
             ny1_full = len(yaxis_full)
             # number of cells
             nx, ny, nz = nx1 - 1, ny1 - 1, nz1 - 1
+            if self.verbose:
+                print(f'Original grid size: {nz1}x{ny1}x{nx1} nodes ({nz}x{ny}x{nx} cells)')
 
             # mesh with indexing 'ij' so shapes are (nz, ny, nx)
             zz, yy, xx = np.meshgrid(zaxis, yaxis, xaxis, indexing="ij")
@@ -222,13 +241,13 @@ class PalmFtle:
             # x, and all the cells in z. We're also replacing all the nans with zeros. We read all the 
             # velocities to allow trajectories to leave the seed domain
             uface = np.nan_to_num( 
-                nc.variables[ fld['u'] ][tmin:tmax, :, :, :], 
+                nc.variables[ fld['u'] ][tmin:tmax, :, :, :],
                 copy=False, nan=0.0)
             vface = np.nan_to_num( 
-                nc.variables[ fld['v'] ][tmin:tmax, :, :, :], 
+                nc.variables[ fld['v'] ][tmin:tmax, :, :, :],
                 copy=False, nan=0.0)
             wface = np.nan_to_num( 
-                nc.variables[ fld['w'] ][tmin:tmax, :, :, :], 
+                nc.variables[ fld['w'] ][tmin:tmax, :, :, :],
                 copy=False, nan=0.0)
 
             tm1 = time.perf_counter()
@@ -336,7 +355,7 @@ time RK4:         {tm3 - tm2:.3f} sec
 time deformation: {tm4 - tm3:.3f} sec
 time eigenvalue:  {tm5 - tm4:.3f} sec
                   """)
-        
+
             return dict(
                 x=xaxis, y=yaxis, z=zaxis, # axes
                 ftle=ftle,
