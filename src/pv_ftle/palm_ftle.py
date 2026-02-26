@@ -241,14 +241,14 @@ NetCDF variable names:
             # x, and all the cells in z. We're also replacing all the nans with zeros. We read all the 
             # velocities to allow trajectories to leave the seed domain
             uface = np.nan_to_num( 
-                nc.variables[ fld['u'] ][tmin:tmax, :, :, :],
-                copy=False, nan=0.0)
+                nc.variables[ fld['u'] ][tmin:tmax, :nz, :ny, :nx1],
+                copy=True, nan=0.0)
             vface = np.nan_to_num( 
-                nc.variables[ fld['v'] ][tmin:tmax, :, :, :],
-                copy=False, nan=0.0)
+                nc.variables[ fld['v'] ][tmin:tmax, :nz, :ny1, :nx],
+                copy=True, nan=0.0)
             wface = np.nan_to_num( 
-                nc.variables[ fld['w'] ][tmin:tmax, :, :, :],
-                copy=False, nan=0.0)
+                nc.variables[ fld['w'] ][tmin:tmax, :nz1, :ny, :nx],
+                copy=True, nan=0.0)
 
             tm1 = time.perf_counter()
 
