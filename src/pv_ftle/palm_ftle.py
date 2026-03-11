@@ -370,7 +370,7 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     @param palmfile PALM NetCDF file with velocity data
     @param vtkout VTK output file
     @param tintegr integration time
-    @param cfl stability condition when integrating the trajectories, should be < 1
+    @param cfl stability condition when integrating the trajectories, should be positive and < 1
     @param imin min x index of window where FTLE will be computed
     @param imax max x index of window where FTLE will be computed
     @param jmin min y index of window where FTLE will be computed
