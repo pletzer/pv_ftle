@@ -442,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Optional outputs / numerics
-    p.add_argument("--vtkout", default="palm_ftel.vtr",
+    p.add_argument("--vtkout", default="palm_ftle.vtr",
                    help="Output VTK .vtr file (default: %(default)s)")
     p.add_argument("--tintegr", type=float, default=-10.0,
                    help="Integration time (default: %(default)s)")
