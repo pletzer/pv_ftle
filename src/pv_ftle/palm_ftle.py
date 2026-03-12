@@ -4,6 +4,7 @@ from vtk import (vtkRectilinearGrid, VTK_FLOAT, vtkXMLRectilinearGridWriter)
 import time
 import re
 import argparse
+from memory_profiler import memory_usage
 
 # so that Python sees the shared libraries
 import sys, os
@@ -209,7 +210,7 @@ NetCDF variable names:
             t_axis = nc.variables[  fld['time'] ][tmin:tmax]
             nt = t_axis.shape[0]
             if not self.frozen and nt < 2:
-                raise ValueError("Need at least two time levels for time-dependent FTLE")
+                raise ValueError(f"Need at least two time levels for time-dependent FTLE. Selected time index: {self.time_index}. Integration time: {self.tintegr}.")
 
             if self.imin < 0 or self.imax >= xaxis_full.size:
                 raise ValueError("Invalid IRange")
@@ -241,20 +242,16 @@ NetCDF variable names:
             # x, and all the cells in z. We're also replacing all the nans with zeros. We read all the 
             # velocities to allow trajectories to leave the seed domain
             uface = np.nan_to_num( 
-                nc.variables[ fld['u'] ][tmin:tmax, :nz, :ny, :nx1],
+                nc.variables[ fld['u'] ][tmin:tmax, :, :, :],
                 copy=True, nan=0.0)
             vface = np.nan_to_num( 
-                nc.variables[ fld['v'] ][tmin:tmax, :nz, :ny1, :nx],
+                nc.variables[ fld['v'] ][tmin:tmax, :, :, :],
                 copy=True, nan=0.0)
             wface = np.nan_to_num( 
-                nc.variables[ fld['w'] ][tmin:tmax, :nz1, :ny, :nx],
+                nc.variables[ fld['w'] ][tmin:tmax, :, :, :],
                 copy=True, nan=0.0)
 
             tm1 = time.perf_counter()
-
-            if self.verbose:
-                print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
-                print(f'uface.shape={uface.shape}\nvface.shape={vface.shape}\nwface.shape={wface.shape}')
 
             # total number of grid points
             n = len(xflat)
@@ -262,7 +259,7 @@ NetCDF variable names:
             # integrate the trajectories. xyz0, the initial position, is a concatenated array of 
             # [x..., y..., z...] positions.
             # Note: FTLE is computed from corner-seeded trajectories.
-            xyz0 = np.concatenate([xflat, yflat, zflat]).astype(np.float64)
+            xyz0 = np.concatenate([xflat, yflat, zflat]).astype(np.float32)
             nsteps = estimate_nsteps(uface, vface, wface, 
                                       dx=dx, dy=dy, dz=dz.min(), 
                                       cfl=self.cfl, T=self.tintegr)
@@ -271,15 +268,23 @@ NetCDF variable names:
 
             tm2 = time.perf_counter()
 
-            # make sure the masked arrays are converted to plain ndarrays
-            xyz0_clean = np.array(xyz0, dtype=np.float64)
-            uface_clean = np.array(uface, dtype=np.float64)
-            vface_clean = np.array(vface, dtype=np.float64)
-            wface_clean = np.array(wface, dtype=np.float64)
-            xaxis_clean = np.array(xaxis_full, dtype=np.float64)
-            yaxis_clean = np.array(yaxis_full, dtype=np.float64)
-            zaxis_clean = np.array(zaxis, dtype=np.float64)
-            t_axis_clean = np.array(t_axis, dtype=np.float64)
+            # make sure the masked arrays are converted to plain, float32 ndarrays
+            # and make sure the arrays have the C grid staggering size
+            xyz0_clean = np.array(xyz0, dtype=np.float32)
+            uface_clean = np.array(uface[:, :, :-1, :], dtype=np.float32)
+            vface_clean = np.array(vface[:, :, :, :-1], dtype=np.float32)
+            wface_clean = np.array(wface[:, :, :-1, :-1], dtype=np.float32)
+            xaxis_clean = np.array(xaxis_full, dtype=np.float32)
+            yaxis_clean = np.array(yaxis_full, dtype=np.float32)
+            zaxis_clean = np.array(zaxis, dtype=np.float32)
+            t_axis_clean = np.array(t_axis, dtype=np.float32)
+
+            if self.verbose:
+                print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
+                print(f'''
+u: shape={uface_clean.shape} type={uface_clean.dtype}
+v: shape={vface_clean.shape} type={vface_clean.dtype}
+w: shape={wface_clean.shape} type={wface_clean.dtype}''')
 
             # Runge-Kutta 4
             time_val = t_axis_clean[0]  # start of selected window
@@ -393,7 +398,9 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     pf.checksum = checksum
     pf.verbose = verbose
 
-    res = pf.compute_ftle()
+    #res = pf.compute_ftle()
+    mem_data, res = memory_usage((pf.compute_ftle, (), {}), max_usage=True, retval=True)
+    print(f"Peak Memory usage of compute_ftle: {mem_data} MiB")
 
     # create a VTK rectilinear grid
     rgrid = vtkRectilinearGrid()

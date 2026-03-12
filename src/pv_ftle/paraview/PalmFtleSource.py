@@ -157,9 +157,9 @@ z = {z}
         grid.SetExtent(0, nx1-1, 0, ny1-1, 0, nz1-1)
 
         # convert the numpy arrays to VTK arrays
-        x_arr = numpy_support.numpy_to_vtk(num_array=x, deep=True, array_type=vtk.VTK_DOUBLE)
-        y_arr = numpy_support.numpy_to_vtk(num_array=y, deep=True, array_type=vtk.VTK_DOUBLE)
-        z_arr = numpy_support.numpy_to_vtk(num_array=z, deep=True, array_type=vtk.VTK_DOUBLE)
+        x_arr = numpy_support.numpy_to_vtk(num_array=x, deep=True, array_type=vtk.VTK_FLOAT)
+        y_arr = numpy_support.numpy_to_vtk(num_array=y, deep=True, array_type=vtk.VTK_FLOAT)
+        z_arr = numpy_support.numpy_to_vtk(num_array=z, deep=True, array_type=vtk.VTK_FLOAT)
         grid.SetXCoordinates(x_arr)
         grid.SetYCoordinates(y_arr)
         grid.SetZCoordinates(z_arr)
