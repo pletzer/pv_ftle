@@ -253,13 +253,6 @@ NetCDF variable names:
 
             tm1 = time.perf_counter()
 
-            if self.verbose:
-                print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
-                print(f'''
-uface.shape={uface.shape} type={uface.dtype}
-vface.shape={vface.shape} type={vface.dtype}
-wface.shape={wface.shape} type={wface.dtype}''')
-
             # total number of grid points
             n = len(xflat)
 
@@ -285,6 +278,13 @@ wface.shape={wface.shape} type={wface.dtype}''')
             yaxis_clean = np.array(yaxis_full, dtype=np.float32)
             zaxis_clean = np.array(zaxis, dtype=np.float32)
             t_axis_clean = np.array(t_axis, dtype=np.float32)
+
+            if self.verbose:
+                print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
+                print(f'''
+u: shape={uface_clean.shape} type={uface_clean.dtype}
+v: shape={vface_clean.shape} type={vface_clean.dtype}
+w: shape={wface_clean.shape} type={wface_clean.dtype}''')
 
             # Runge-Kutta 4
             time_val = t_axis_clean[0]  # start of selected window
