@@ -258,7 +258,7 @@ NetCDF variable names:
             # integrate the trajectories. xyz0, the initial position, is a concatenated array of 
             # [x..., y..., z...] positions.
             # Note: FTLE is computed from corner-seeded trajectories.
-            xyz0 = np.concatenate([xflat, yflat, zflat]).astype(np.float64)
+            xyz0 = np.concatenate([xflat, yflat, zflat]).astype(np.float32)
             nsteps = estimate_nsteps(uface, vface, wface, 
                                       dx=dx, dy=dy, dz=dz.min(), 
                                       cfl=self.cfl, T=self.tintegr)
@@ -267,16 +267,16 @@ NetCDF variable names:
 
             tm2 = time.perf_counter()
 
-            # make sure the masked arrays are converted to plain float64 ndarrays
+            # make sure the masked arrays are converted to plain float32 ndarrays
             # make sure the velocities have the right sizes
-            xyz0_clean = np.array(xyz0, dtype=np.float64)
-            uface_clean = np.array(uface[:, :, :-1, :], dtype=np.float64)
-            vface_clean = np.array(vface[:, :, :, :-1], dtype=np.float64)
-            wface_clean = np.array(wface[:, :, :-1, :-1], dtype=np.float64)
-            xaxis_clean = np.array(xaxis_full, dtype=np.float64)
-            yaxis_clean = np.array(yaxis_full, dtype=np.float64)
-            zaxis_clean = np.array(zaxis, dtype=np.float64)
-            t_axis_clean = np.array(t_axis, dtype=np.float64)
+            xyz0_clean = np.array(xyz0, dtype=np.float32)
+            uface_clean = np.array(uface[:, :, :-1, :], dtype=np.float32)
+            vface_clean = np.array(vface[:, :, :, :-1], dtype=np.float32)
+            wface_clean = np.array(wface[:, :, :-1, :-1], dtype=np.float32)
+            xaxis_clean = np.array(xaxis_full, dtype=np.float32)
+            yaxis_clean = np.array(yaxis_full, dtype=np.float32)
+            zaxis_clean = np.array(zaxis, dtype=np.float32)
+            t_axis_clean = np.array(t_axis, dtype=np.float32)
 
             if self.verbose:
                 print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
