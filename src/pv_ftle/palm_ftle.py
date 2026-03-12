@@ -252,10 +252,6 @@ NetCDF variable names:
 
             tm1 = time.perf_counter()
 
-            if self.verbose:
-                print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
-                print(f'uface.shape={uface.shape}\nvface.shape={vface.shape}\nwface.shape={wface.shape}')
-
             # total number of grid points
             n = len(xflat)
 
@@ -271,15 +267,24 @@ NetCDF variable names:
 
             tm2 = time.perf_counter()
 
-            # make sure the masked arrays are converted to plain ndarrays
+            # make sure the masked arrays are converted to plain float64 ndarrays
+            # make sure the velocities have the right sizes
             xyz0_clean = np.array(xyz0, dtype=np.float64)
-            uface_clean = np.array(uface, dtype=np.float64)
-            vface_clean = np.array(vface, dtype=np.float64)
-            wface_clean = np.array(wface, dtype=np.float64)
+            uface_clean = np.array(uface[:, :, :-1, :], dtype=np.float64)
+            vface_clean = np.array(vface[:, :, :, :-1], dtype=np.float64)
+            wface_clean = np.array(wface[:, :, :-1, :-1], dtype=np.float64)
             xaxis_clean = np.array(xaxis_full, dtype=np.float64)
             yaxis_clean = np.array(yaxis_full, dtype=np.float64)
             zaxis_clean = np.array(zaxis, dtype=np.float64)
             t_axis_clean = np.array(t_axis, dtype=np.float64)
+
+            if self.verbose:
+                print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
+                print(f'''
+u  : shape={uface_clean.shape} type={uface_clean.dtype}
+v  : shape={vface_clean.shape} type={vface_clean.dtype}
+w  : shape={wface_clean.shape} type={wface_clean.dtype}
+xyz: shape={xyz0_clean.shape} type={xyz0_clean.dtype}''')
 
             # Runge-Kutta 4
             time_val = t_axis_clean[0]  # start of selected window
