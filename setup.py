@@ -48,7 +48,8 @@ setup(
     install_requires=[
         "numpy>=1.22",
         "netCDF4>=1.7",
-        "vtk>=9.2"
+        "vtk>=9.2",
+        "memory_profiler",
     ],
     python_requires=">=3.8",
     zip_safe=False,

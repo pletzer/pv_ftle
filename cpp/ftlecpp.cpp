@@ -13,23 +13,23 @@ namespace py = pybind11;
 // Velocity interpolation
 // -----------------------------------------------------------------------------
 void interp_velocity(
-    double time_val,
+    float time_val,
     size_t n,
-    const double* xyz_ptr,
-    double* uvw_ptr,
-    const py::array_t<double>& uface,
-    const py::array_t<double>& vface,
-    const py::array_t<double>& wface,
-    const py::array_t<double>& xaxis_full,
-    const py::array_t<double>& yaxis_full,
-    const py::array_t<double>& zaxis,
-    double dx,
-    double dy,
+    const float* xyz_ptr,
+    float* uvw_ptr,
+    const py::array_t<float>& uface,
+    const py::array_t<float>& vface,
+    const py::array_t<float>& wface,
+    const py::array_t<float>& xaxis_full,
+    const py::array_t<float>& yaxis_full,
+    const py::array_t<float>& zaxis,
+    float dx,
+    float dy,
     int nx1_full,
     int ny1_full,
     int nz1,
     bool frozen,
-    const py::array_t<double>& t_axis
+    const py::array_t<float>& t_axis
 ) {
     auto u_r = uface.unchecked<4>();
     auto v_r = vface.unchecked<4>();
@@ -41,79 +41,79 @@ void interp_velocity(
 
     #pragma omp parallel for
     for (size_t idx = 0; idx < n; ++idx) {
-        double xi = xyz_ptr[idx];
-        double yi = xyz_ptr[idx + n];
-        double zi = xyz_ptr[idx + 2*n];
+        float xi = xyz_ptr[idx];
+        float yi = xyz_ptr[idx + n];
+        float zi = xyz_ptr[idx + 2*n];
 
-        double ifloat = (xi - x_r(0)) / dx;
-        double jfloat = (yi - y_r(0)) / dy;
-        ifloat = std::clamp(ifloat, 0.0, double(nx1_full - 1));
-        jfloat = std::clamp(jfloat, 0.0, double(ny1_full - 1));
+        float ifloat = (xi - x_r(0)) / dx;
+        float jfloat = (yi - y_r(0)) / dy;
+        ifloat = std::clamp(ifloat, 0.0f, float(nx1_full - 1));
+        jfloat = std::clamp(jfloat, 0.0f, float(ny1_full - 1));
 
         int i0 = std::clamp(int(std::floor(ifloat)), 0, nx1_full - 2);
         int j0 = std::clamp(int(std::floor(jfloat)), 0, ny1_full - 2);
         int k0 = std::clamp(int(std::lower_bound(&z_r(0), &z_r(0) + nz1, zi) - &z_r(0)) - 1, 0, nz1 - 2);
 
-        double xsi = ifloat - i0;
-        double eta = jfloat - j0;
-        double zet = (zi - z_r(k0)) / (z_r(k0 + 1) - z_r(k0));
+        float xsi = ifloat - i0;
+        float eta = jfloat - j0;
+        float zet = (zi - z_r(k0)) / (z_r(k0 + 1) - z_r(k0));
 
-        double isx = 1.0 - xsi;
-        double ate = 1.0 - eta;
-        double tez = 1.0 - zet;
+        float isx = 1.0f - xsi;
+        float ate = 1.0f - eta;
+        float tez = 1.0f - zet;
 
         int time_index0, time_index1;
-        double mu;
+        float mu;
         if (frozen) {
             time_index0 = 0;
-            mu = 0.0;
+            mu = 0.0f;
             time_index1 = 0;
         } else {
             size_t nt = t_axis.shape(0);
-            double dt_uniform = t_r(1) - t_r(0);
-            double idxf = (time_val - t_r(0)) / dt_uniform;
+            float dt_uniform = t_r(1) - t_r(0);
+            float idxf = (time_val - t_r(0)) / dt_uniform;
             time_index0 = std::clamp(int(std::floor(idxf)), 0, int(nt - 2));
             time_index1 = std::clamp(time_index0 + 1, 1, int(nt - 1));
-            mu = std::clamp(idxf - time_index0, 0.0, 1.0);
+            mu = std::clamp(idxf - time_index0, 0.0f, 1.0f);
         }
 
         // interpolate u, v, w
-        double u0 = u_r(time_index0, k0, j0, i0) * isx + u_r(time_index0, k0, j0, i0 + 1) * xsi;
-        double u1 = u_r(time_index1, k0, j0, i0) * isx + u_r(time_index1, k0, j0, i0 + 1) * xsi;
+        float u0 = u_r(time_index0, k0, j0, i0) * isx + u_r(time_index0, k0, j0, i0 + 1) * xsi;
+        float u1 = u_r(time_index1, k0, j0, i0) * isx + u_r(time_index1, k0, j0, i0 + 1) * xsi;
 
-        double v0 = v_r(time_index0, k0, j0, i0) * ate + v_r(time_index0, k0, j0 + 1, i0) * eta;
-        double v1 = v_r(time_index1, k0, j0, i0) * ate + v_r(time_index1, k0, j0 + 1, i0) * eta;
+        float v0 = v_r(time_index0, k0, j0, i0) * ate + v_r(time_index0, k0, j0 + 1, i0) * eta;
+        float v1 = v_r(time_index1, k0, j0, i0) * ate + v_r(time_index1, k0, j0 + 1, i0) * eta;
 
-        double w0 = w_r(time_index0, k0, j0, i0) * tez + w_r(time_index0, k0 + 1, j0, i0) * zet;
-        double w1 = w_r(time_index1, k0, j0, i0) * tez + w_r(time_index1, k0 + 1, j0, i0) * zet;
+        float w0 = w_r(time_index0, k0, j0, i0) * tez + w_r(time_index0, k0 + 1, j0, i0) * zet;
+        float w1 = w_r(time_index1, k0, j0, i0) * tez + w_r(time_index1, k0 + 1, j0, i0) * zet;
 
-        uvw_ptr[idx] = (1.0 - mu) * u0 + mu * u1;
-        uvw_ptr[idx + n] = (1.0 - mu) * v0 + mu * v1;
-        uvw_ptr[idx + 2 * n] = (1.0 - mu) * w0 + mu * w1;
+        uvw_ptr[idx] = (1.0f - mu) * u0 + mu * u1;
+        uvw_ptr[idx + n] = (1.0f - mu) * v0 + mu * v1;
+        uvw_ptr[idx + 2 * n] = (1.0f - mu) * w0 + mu * w1;
     }
 }
 
 // -----------------------------------------------------------------------------
 // RK4 integration
 // -----------------------------------------------------------------------------
-py::array_t<double> integrate_rk4(
-    const py::array_t<double>& xyz0,
-    double t0,
-    double dt, // per step
+py::array_t<float> integrate_rk4(
+    const py::array_t<float>& xyz0,
+    float t0,
+    float dt, // per step
     int nsteps,
-    const py::array_t<double>& uface,
-    const py::array_t<double>& vface,
-    const py::array_t<double>& wface,
-    const py::array_t<double>& xaxis_full,
-    const py::array_t<double>& yaxis_full,
-    const py::array_t<double>& zaxis,
-    double dx,
-    double dy,
+    const py::array_t<float>& uface,
+    const py::array_t<float>& vface,
+    const py::array_t<float>& wface,
+    const py::array_t<float>& xaxis_full,
+    const py::array_t<float>& yaxis_full,
+    const py::array_t<float>& zaxis,
+    float dx,
+    float dy,
     int nx1_full,
     int ny1_full,
     int nz1,
     bool frozen,
-    const py::array_t<double>& t_axis
+    const py::array_t<float>& t_axis
 ) {
     if (xyz0.ndim() != 1 || xyz0.shape(0) % 3 != 0)
         throw std::runtime_error("xyz0 must be flat array of length 3*N");
@@ -130,15 +130,15 @@ py::array_t<double> integrate_rk4(
     size_t n = xyz_ptr0.shape(0) / 3;
 
     // Initialize position vectors
-    std::vector<double> xyz(3 * n);
+    std::vector<float> xyz(3 * n);
     for (size_t i = 0; i < 3 * n; ++i) {
         xyz[i] = xyz_ptr0(i);
     }
 
-    std::vector<double> k1(3 * n), k2(3 * n), k3(3 * n), k4(3 * n), tmp(3 * n);
+    std::vector<float> k1(3 * n), k2(3 * n), k3(3 * n), k4(3 * n), tmp(3 * n);
 
     for (int step = 0; step < nsteps; ++step) {
-        double t = t0 + step * dt;
+        float t = t0 + step * dt;
 
         interp_velocity(t, n, xyz.data(), k1.data(),
                         uface, vface, wface,
@@ -172,7 +172,7 @@ py::array_t<double> integrate_rk4(
     }
 
     // Return final positions as a NumPy array
-    py::array_t<double> result(3 * n);
+    py::array_t<float> result(3 * n);
     auto res_ptr = result.mutable_unchecked<1>();
     for (size_t i = 0; i < 3 * n; ++i) {
         res_ptr(i) = xyz[i];
