@@ -35,7 +35,7 @@ class CMakeBuild(build_ext):
 
 setup(
     name="pv_ftle",
-    version="0.1.0",
+    version="0.9.0",
     packages=find_packages("src"),
     package_dir={"": "src"},
     entry_points={
