@@ -1,4 +1,5 @@
 # pv_ftle
+[![DOI](https://zenodo.org/badge/1129942283.svg)](https://doi.org/10.5281/zenodo.20060141)
 
 This repository provides a ParaView plugin and a command-line tool to compute the
 **finite-time Lyapunov exponent (FTLE)** from simulation data produced by the
