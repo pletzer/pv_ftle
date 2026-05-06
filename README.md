@@ -86,11 +86,15 @@ The table below shows the effect of `OMP_NUM_THREADS` for `i=100:400`, `j=100:40
 
 ## How to invoke the Paraview plugin
 
-The computation of the finite time Lypunov exponent can be performed within Paraview using a source plugin. The plugin must have been installed with `pip install .`. 
+The computation of the finite time Lypunov exponent can be performed within Paraview using a source plugin. 
+
+The plugin must have been installed with `pip install .` and the Python version bundled with
+Paraview must be compatible the virtual environment Python (e.g. 3.12). 
 
 To enable Paraview to find the `pv_ftle` package, point 
 ```sh
-export PYTHONPATH=<path/to/>venv/lib/python3.12/site-packages
+export PY_VERSION=$(python -c "import sys; print('.'.join(map(str, sys.version_info[:2])))")
+export PYTHONPATH=./venv/lib/python${PY_VERSION}/site-packages
 ```
 to the location where `pf_ftle` was installed. (Adapt as required.)
 
@@ -102,13 +106,14 @@ export OMP_NUM_THREADS=8
 Start Paraview. Then to load the plugin:
  * In the menu `Tools` select `Manage Plugins...`
  * Press `Load New`, navigate to the directory where `PalmFtleSource.py` resides (e.g. 
- `venv/lib/python3.12/site-packages/pv_ftle/paraview`)
+ `venv/lib/python${PY_VERSION}/site-packages/pv_ftle/paraview`)
  * Click on `PalmFtleSource.py` and press `OK`. Wait for a few seconds, giving Paraview the time to load the plugin. 
  * Close the `Plugin Manager` window. (critical otherwise the plugin will not be loaded)
  * The plugin will appaear under the `Source` -> `Alphabetical` -> `PALM FTLE Source` 
 
 Setting
 ```sh
-export PV_PLUGIN_PATH=<path/to>/venv/lib/python3.12/site-packages/pv_ftle/paraview
+export PY_VERSION=$(python -c "import sys; print('.'.join(map(str, sys.version_info[:2])))")
+export PV_PLUGIN_PATH=./venv/lib/python${PY_VERSION}/site-packages/pv_ftle/paraview
 ```
 will automatically load the plugin each time you launch Paraview. (Adapt as required.)
