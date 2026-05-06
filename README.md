@@ -38,11 +38,17 @@ source venv/bin/activate
 
 ## How to install the pv_ftle package
 
+On Mac, many compiler installations don't include OpenMP. Make sure to,
+```
+brew install llvm libomp
+```
+
 In this directory, 
 ```sh
 pip install .
 ```
 (Note: do not use editable install, i.e. `pip install -e .` when using the Paraview plugin, see below.)
+
 
 ## How to test the package
 
@@ -50,7 +56,11 @@ Type
 ```sh
 palm_ftle -h
 ```
-to see the full list of options. Example:
+to see the full list of options. (It may take a few minutes the first
+time for the command to complete due to the large number of 
+dynamic libraries to be loaded.)
+
+Example:
 ```sh
 palm_ftle small_blf_day_loc1_4m_xy_N04.003.nc --imin=100 --imax=200 --jmin=300 --jmax=400 --tintegr=10 --time-index=10 --vtkout=ftle.vtr --checksum --verbose
 ```
