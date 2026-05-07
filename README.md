@@ -40,7 +40,7 @@ source venv/bin/activate
 ## How to install the pv_ftle package
 
 On Mac, many compiler installations don't include OpenMP. Make sure to,
-```
+```sh
 brew install llvm libomp
 ```
 
