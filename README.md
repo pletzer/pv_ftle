@@ -65,7 +65,9 @@ Example:
 ```sh
 palm_ftle small_blf_day_loc1_4m_xy_N04.003.nc --imin=100 --imax=200 --jmin=300 --jmax=400 --tintegr=10 --time-index=10 --vtkout=ftle.vtr --checksum --verbose
 ```
-for PALM file `small_blf_day_loc1_4m_xy_N04.003.nc`. This will save the FTLE data in file `ftle.vtr`. 
+for PALM file `small_blf_day_loc1_4m_xy_N04.003.nc`. This will save the FTLE data in file `ftle.vtr`.
+
+Test data is provided in the testdata directory along with the FTLE output used in the manuscript: "Mimetic interpolation for finite-time Lyapunov exponent computation near irregular domain boundaries"
 
 ### Setting the number of threads
 
