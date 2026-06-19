@@ -176,27 +176,49 @@ def _trilinear_derivs(corners, xi, eta, zeta):
 
 # ── face fluxes ───────────────────────────────────────────────────────────────
 
+def _quad_area_vec(A, B, C, D):
+    """
+    Area vector of quadrilateral ABCD (traversed in order):
+    0.5 * (C-A) × (D-B)  — half the cross-product of diagonals.
+    Inputs (..., 3) → (..., 3).
+    """
+    return 0.5 * np.cross(C - A, D - B)
+
+
 def _quad_area_mag(A, B, C, D):
+    """Scalar area magnitude from _quad_area_vec."""
+    return np.linalg.norm(_quad_area_vec(A, B, C, D), axis=-1)
+
+
+def _local_up(r):
     """
-    Magnitude of area vector for quadrilateral ABCD (traversed in order).
-    Uses half the cross-product of diagonals: |0.5 (C-A) × (D-B)|.
-    Inputs (..., 3) → scalar (...).
+    Local radial unit vector (up direction on the sphere) at positions r (..., 3).
     """
-    return 0.5 * np.linalg.norm(np.cross(C - A, D - B), axis=-1)
+    n = np.linalg.norm(r, axis=-1, keepdims=True)
+    return r / np.where(n > 0, n, 1.0)
 
 
 def compute_face_fluxes(U, V, W, r_corners):
     """
-    Compute face-normal flux φ = velocity × face-area for every cell face.
+    Compute face-normal flux φ = velocity · face-area-vector for every cell face.
 
     U : (nz, ny, nx+1)  grid-relative west-east wind   (m/s)
     V : (nz, ny+1, nx)  grid-relative south-north wind  (m/s)
-    W : (nz+1, ny, nx)  vertical wind on W-stagger      (m/s)
+    W : (nz+1, ny, nx)  geometric vertical wind (dz/dt) on W-stagger (m/s)
     r_corners : (nz+1, ny+1, nx+1, 3)
 
-    Returns dict with keys xi_minus, xi_plus, eta_minus, eta_plus,
-    zeta_minus, zeta_plus, each shape (nz, ny, nx).
-    Units: m³/s  (velocity × area).
+    For ξ- and η-faces U and V are already the normal components (grid-relative),
+    so φ = velocity × |face area| is exact for orthogonal grids.
+
+    For ζ-faces W is the geometric (radial) velocity, NOT the component normal to
+    the terrain-following η-surfaces.  The correct flux is:
+        φ_ζ = W · (ê_up · A_ζ_vec)
+    where ê_up is the local radial unit vector and A_ζ_vec the face area vector.
+    Over flat terrain ê_up ∥ A_ζ_vec and this reduces to W × |A_ζ|; over sloped
+    terrain (orography) the projection removes the error from face tilt.
+
+    Returns dict with keys xi_m, xi_p, et_m, et_p, zt_m, zt_p,
+    each shape (nz, ny, nx).  Units: m³/s.
     """
     rc = r_corners
 
@@ -221,12 +243,22 @@ def compute_face_fluxes(U, V, W, r_corners):
     flux_et_p = et_flux[:,  1:, :]
 
     # ζ-faces: constant k planes, corners span (i, i+1) × (j, j+1)
+    # W is the geometric vertical (dz/dt), so project onto the face area VECTOR
+    # via the local up direction, not the full face area magnitude.
     zt_A = rc[:, :-1, :-1]   # (nz+1, ny, nx, 3)
     zt_B = rc[:, :-1,  1:]
     zt_C = rc[:,  1:,  1:]
     zt_D = rc[:,  1:, :-1]
-    zt_area = _quad_area_mag(zt_A, zt_B, zt_C, zt_D)   # (nz+1, ny, nx)
-    zt_flux  = W * zt_area
+    zt_avec = _quad_area_vec(zt_A, zt_B, zt_C, zt_D)   # (nz+1, ny, nx, 3)
+
+    # Local up at face centre (average of 4 corners, then normalise)
+    r_face_centre = 0.25 * (zt_A + zt_B + zt_C + zt_D)   # (nz+1, ny, nx, 3)
+    up = _local_up(r_face_centre)                          # (nz+1, ny, nx, 3)
+
+    # Projected area: scalar ê_up · A_vec  (nz+1, ny, nx)
+    zt_proj = np.einsum('...i,...i->...', up, zt_avec)
+
+    zt_flux  = W * zt_proj
     flux_zt_m = zt_flux[:-1, :, :]   # (nz, ny, nx)
     flux_zt_p = zt_flux[ 1:, :, :]
 
