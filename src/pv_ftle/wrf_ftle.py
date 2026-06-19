@@ -24,10 +24,27 @@ where w_f is the Whitney-like weight (e.g. (1-ξ) for the ξ=0 face),
 ∂r/∂s_f is the corresponding partial derivative of the trilinear map, and
 J = ∂r/∂ξ · (∂r/∂η × ∂r/∂ζ) is the Jacobian.
 
-Note on WRF wind components: for a polar-stereographic projection WRF stores
-U and V in grid-relative (ξ, η) coordinates, so no rotation is required for
-computing face fluxes.  Set rotate_winds=True if your file uses Earth-relative
-(e.g. Mercator) output and COSALPHA/SINALPHA are present.
+Wind rotation notes
+-------------------
+For face-flux computation we need the component *normal to each face*, which is
+the grid-relative component.  WRF stores U/V in grid-relative coordinates for
+rotated projections (Lambert Conformal MAP_PROJ=1, Polar Stereographic MAP_PROJ=2),
+so *no rotation is needed* for those cases — U is already the ξ-normal velocity
+and V the η-normal velocity.
+
+For non-rotated projections (Mercator MAP_PROJ=3, Lat/Lon MAP_PROJ=6) U and V
+are Earth-relative (geographic east/north), and must be rotated to grid-relative
+before computing face fluxes.
+
+By default (rotate_winds=None) the correct choice is inferred automatically from
+the MAP_PROJ global attribute in the WRF file.  Pass rotate_winds=True/False to
+override.
+
+MAP_PROJ values:
+  1 – Lambert Conformal      grid-relative  → rotate_winds = False
+  2 – Polar Stereographic    grid-relative  → rotate_winds = False
+  3 – Mercator               Earth-relative → rotate_winds = True
+  6 – Lat/Lon                Earth-relative → rotate_winds = True
 """
 
 import numpy as np
@@ -402,18 +419,39 @@ def compute_ftle(F, tintegr):
 
 class WrfFtle:
 
+    # MAP_PROJ values that store winds in Earth-relative coordinates
+    _EARTH_RELATIVE_PROJECTIONS = {3, 6}
+
     def __init__(self):
-        self.wrffile    = ""
-        self.tintegr    = -3600.0   # seconds (negative = backward)
-        self.cfl        = 0.25
-        self.time_index = 0
-        self.rotate_winds = False   # True if winds are Earth-relative
-        self.verbose    = False
+        self.wrffile      = ""
+        self.tintegr      = -3600.0   # seconds (negative = backward)
+        self.cfl          = 0.25
+        self.time_index   = 0
+        self.rotate_winds = None      # None = auto-detect from MAP_PROJ
+        self.verbose      = False
+
+    @staticmethod
+    def needs_rotation(ds):
+        """
+        Return True if U/V in this WRF file are Earth-relative and must be
+        rotated to grid-relative before computing face fluxes.
+        Reads MAP_PROJ from global attributes; defaults to False if absent.
+        """
+        map_proj = int(ds.attrs.get('MAP_PROJ', 1))
+        return map_proj in WrfFtle._EARTH_RELATIVE_PROJECTIONS
 
     def compute(self):
         t0 = time.perf_counter()
         ds = xr.open_dataset(self.wrffile)
         ti = self.time_index
+
+        # ── auto-detect wind rotation from MAP_PROJ ───────────────────────
+        rotate = self.rotate_winds
+        if rotate is None:
+            rotate = WrfFtle.needs_rotation(ds)
+        if self.verbose:
+            map_proj = int(ds.attrs.get('MAP_PROJ', '?'))
+            print(f'MAP_PROJ={map_proj}  rotate_winds={rotate}')
 
         # ── grid ─────────────────────────────────────────────────────────
         lats = ds['XLAT' ][ti].values          # (ny, nx)
@@ -427,7 +465,7 @@ class WrfFtle:
         V = ds['V'][ti].values.astype(np.float64)   # (nz, ny+1, nx)
         W = ds['W'][ti].values.astype(np.float64)   # (nz+1, ny, nx)
 
-        if self.rotate_winds:
+        if rotate:
             # Rotate Earth-relative → grid-relative using COSALPHA/SINALPHA.
             # Since U and V are on different stagger grids we interpolate the
             # rotation angles to each stagger before applying.
@@ -532,7 +570,7 @@ class WrfFtle:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
-         time_index=0, rotate_winds=False, visualise=False, verbose=False):
+         time_index=0, rotate_winds=None, visualise=False, verbose=False):
     wf = WrfFtle()
     wf.wrffile       = wrffile
     wf.tintegr       = tintegr
@@ -569,9 +607,12 @@ def build_parser():
                    help='Integration time in seconds (negative=backward)')
     p.add_argument('--cfl',           type=float, default=0.25)
     p.add_argument('--time-index',    type=int,   default=0)
-    p.add_argument('--rotate-winds',  action='store_true',
-                   help='Rotate Earth-relative winds to grid-relative '
-                        '(not needed for polar-stereographic WRF output)')
+    grp = p.add_mutually_exclusive_group()
+    grp.add_argument('--rotate-winds',    dest='rotate_winds', action='store_true',  default=None,
+                     help='Force wind rotation (Earth-relative → grid-relative)')
+    grp.add_argument('--no-rotate-winds', dest='rotate_winds', action='store_false',
+                     help='Force no wind rotation')
+    p.set_defaults(rotate_winds=None)  # None = auto-detect from MAP_PROJ
     p.add_argument('--visualise',     action='store_true')
     p.add_argument('--verbose',       action='store_true')
     return p
