@@ -283,7 +283,7 @@ def reconstruct_velocity(xi, eta, zeta, phi, corners):
 
     # Einstein summation
     J = np.einsum('ni,ni->n', dxi, np.cross(det, dzt))   # (N,)
-    # J = (dxi * np.cross(det, dzt)).sum(axis=-1)
+    # alternatively J = (dxi * np.cross(det, dzt)).sum(axis=-1)
 
     # Guard against degenerate cells (zero-volume, terrain-following collapse).
     # Use a threshold relative to the RMS Jacobian so it scales with grid size.
@@ -487,10 +487,10 @@ class WrfFtle:
         self.cfl          = 0.25
         self.time_index   = 0
         self.rotate_winds = None      # None = auto-detect from MAP_PROJ
-        # Seeding/output sub-region (cell indices, inclusive).
-        # None means use the full domain extent.
-        self.imin = None;  self.imax = None
-        self.jmin = None;  self.jmax = None
+        self.imin         = None      # seed sub-region (cell indices, None = full domain)
+        self.imax         = None
+        self.jmin         = None
+        self.jmax         = None
         self.verbose      = False
 
     @staticmethod
@@ -571,31 +571,17 @@ class WrfFtle:
 
         t2 = time.perf_counter()
 
-        # ── resolve seed sub-region (cell indices, inclusive) ─────────────
-        # Velocity field and KD-tree always cover the FULL domain so that
-        # trajectories can leave the seed region freely.
+        # ── seed at corner nodes (optionally restricted to sub-region) ───────
         imin = self.imin if self.imin is not None else 0
         imax = self.imax if self.imax is not None else nx - 1
         jmin = self.jmin if self.jmin is not None else 0
         jmax = self.jmax if self.jmax is not None else ny - 1
-
-        # Clamp to valid cell range
-        imin = max(imin, 0);  imax = min(imax, nx - 1)
-        jmin = max(jmin, 0);  jmax = min(jmax, ny - 1)
-
-        if self.verbose:
-            print(f'Seed region: i={imin}..{imax}  j={jmin}..{jmax}  '
-                  f'(full domain: i=0..{nx-1}  j=0..{ny-1})')
-
-        # Corner sub-array for the seed region: cells imin..imax, jmin..jmax
-        # need corners imin..imax+1 in i and jmin..jmax+1 in j (all k).
-        rc_seed = r_corners[:, jmin:jmax+2, imin:imax+2, :]  # (nzp1, njs+1, nis+1, 3)
-        nzp1_s, nyp1_s, nxp1_s = rc_seed.shape[:3]
-
+        # corners: need imax+2, jmax+2 to include all corners bounding cells [imin..imax]
+        rc_seed = r_corners[:, jmin:jmax+2, imin:imax+2, :]
         seeds = rc_seed.reshape(-1, 3)
         N = len(seeds)
         if self.verbose:
-            print(f'Seed points: {N}')
+            print(f'Seed region: i=[{imin},{imax}] j=[{jmin},{jmax}]  seed points: {N}')
 
         # CFL-based step count.
         # Use the 5th-percentile cell edge length (not the minimum) so that a
@@ -625,7 +611,8 @@ class WrfFtle:
         t4 = time.perf_counter()
 
         # ── FTLE ──────────────────────────────────────────────────────────
-        Xf   = final.reshape(nzp1_s, nyp1_s, nxp1_s, 3)
+        seed_shape = rc_seed.shape[:3]   # (nz+1, jmax-jmin+2, imax-imin+2)
+        Xf   = final.reshape(*seed_shape, 3)
         F    = gradient_curvilinear(Xf, rc_seed)
         ftle = compute_ftle(F, self.tintegr)
 
@@ -659,17 +646,18 @@ class WrfFtle:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
-         time_index=0, rotate_winds=None,
-         imin=None, imax=None, jmin=None, jmax=None,
-         visualise=False, verbose=False):
+         time_index=0, rotate_winds=None, imin=None, imax=None, jmin=None,
+         jmax=None, visualise=False, verbose=False):
     wf = WrfFtle()
     wf.wrffile       = wrffile
     wf.tintegr       = tintegr
     wf.cfl           = cfl
     wf.time_index    = time_index
     wf.rotate_winds  = rotate_winds
-    wf.imin = imin;  wf.imax = imax
-    wf.jmin = jmin;  wf.jmax = jmax
+    wf.imin          = imin
+    wf.imax          = imax
+    wf.jmin          = jmin
+    wf.jmax          = jmax
     wf.verbose       = verbose
 
     result = wf.compute()
@@ -706,14 +694,14 @@ def build_parser():
     grp.add_argument('--no-rotate-winds', dest='rotate_winds', action='store_false',
                      help='Force no wind rotation')
     p.set_defaults(rotate_winds=None)  # None = auto-detect from MAP_PROJ
-    p.add_argument('--imin', type=int, default=None,
-                   help='Min west-east cell index for seeding (default: 0)')
-    p.add_argument('--imax', type=int, default=None,
-                   help='Max west-east cell index for seeding (default: nx-1)')
-    p.add_argument('--jmin', type=int, default=None,
-                   help='Min south-north cell index for seeding (default: 0)')
-    p.add_argument('--jmax', type=int, default=None,
-                   help='Max south-north cell index for seeding (default: ny-1)')
+    p.add_argument('--imin',          type=int, default=None,
+                   help='First i cell index for seed region (default: 0)')
+    p.add_argument('--imax',          type=int, default=None,
+                   help='Last i cell index for seed region (default: nx-1)')
+    p.add_argument('--jmin',          type=int, default=None,
+                   help='First j cell index for seed region (default: 0)')
+    p.add_argument('--jmax',          type=int, default=None,
+                   help='Last j cell index for seed region (default: ny-1)')
     p.add_argument('--visualise',     action='store_true')
     p.add_argument('--verbose',       action='store_true')
     return p
@@ -724,8 +712,7 @@ def cli():
     main(wrffile=args.wrffile, vtkout=args.vtkout, tintegr=args.tintegr,
          cfl=args.cfl, time_index=args.time_index,
          rotate_winds=args.rotate_winds,
-         imin=args.imin, imax=args.imax,
-         jmin=args.jmin, jmax=args.jmax,
+         imin=args.imin, imax=args.imax, jmin=args.jmin, jmax=args.jmax,
          visualise=args.visualise, verbose=args.verbose)
 
 
