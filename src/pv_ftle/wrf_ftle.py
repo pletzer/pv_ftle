@@ -281,17 +281,26 @@ def reconstruct_velocity(xi, eta, zeta, phi, corners):
     """
     dxi, det, dzt = _trilinear_derivs(corners, xi, eta, zeta)
 
-    J = np.einsum('ni,ni->n', dxi, np.cross(det, dzt))[:, None]   # (N,1)
+    # Einstein summation
+    J = np.einsum('ni,ni->n', dxi, np.cross(det, dzt))   # (N,)
+    # J = (dxi * np.cross(det, dzt)).sum(axis=-1)
+
+    # Guard against degenerate cells (zero-volume, terrain-following collapse).
+    # Use a threshold relative to the RMS Jacobian so it scales with grid size.
+    J_rms = float(np.sqrt(np.nanmean(J**2))) or 1.0
+    J_safe = np.where(np.abs(J) > 1e-6 * J_rms, J, np.nan)[:, None]  # (N,1)
 
     a = xi  [:, None];  b = eta[:, None];  c = zeta[:, None]
 
-    u = ((1-a) * phi[:,0:1] * dxi / J
-       +    a  * phi[:,1:2] * dxi / J
-       + (1-b) * phi[:,2:3] * det / J
-       +    b  * phi[:,3:4] * det / J
-       + (1-c) * phi[:,4:5] * dzt / J
-       +    c  * phi[:,5:6] * dzt / J)
-    return u   # (N, 3)
+    u = ((1-a) * phi[:,0:1] * dxi / J_safe
+       +    a  * phi[:,1:2] * dxi / J_safe
+       + (1-b) * phi[:,2:3] * det / J_safe
+       +    b  * phi[:,3:4] * det / J_safe
+       + (1-c) * phi[:,4:5] * dzt / J_safe
+       +    c  * phi[:,5:6] * dzt / J_safe)
+
+    # Replace NaN (degenerate cells) with zero velocity — particle stays put.
+    return np.nan_to_num(u, nan=0.0)
 
 
 # ── cell finding ──────────────────────────────────────────────────────────────
@@ -332,7 +341,20 @@ def find_cell_and_bary(pos, kdtree, r_corners, shape, max_iter=8):
         resid = pos - r_est                            # (N, 3)
         dxi, det, dzt = _trilinear_derivs(corners, xi, eta, zeta)
         Jmat = np.stack([dxi, det, dzt], axis=-1)     # (N, 3, 3) columns=∂r/∂s
-        d = np.linalg.solve(Jmat, resid)              # (N, 3)
+
+        # In Cartesian coordinates a non-degenerate cell must have a non-singular
+        # Jacobian.  Near-zero determinants indicate genuinely degenerate cells
+        # in WRF's terrain-following grid (e.g. near-surface η-levels that are
+        # essentially zero-thickness over steep terrain).  Skip those cells —
+        # barycentric coords stay at their current estimate.
+        jdet  = np.linalg.det(Jmat)                   # (N,)
+        j_rms = np.sqrt(np.mean(jdet[np.isfinite(jdet)]**2))
+        ok    = np.abs(jdet) > 1e-6 * j_rms           # relative threshold
+        d     = np.zeros_like(resid)
+        if ok.any():
+            d[ok] = np.linalg.solve(
+                Jmat[ok], resid[ok, :, np.newaxis])[..., 0]
+
         xi   = np.clip(xi   + d[:, 0], 0.0, 1.0)
         eta  = np.clip(eta  + d[:, 1], 0.0, 1.0)
         zeta = np.clip(zeta + d[:, 2], 0.0, 1.0)
@@ -378,7 +400,12 @@ def integrate_rk4(seeds, dt, nsteps, kdtree, r_corners, fluxes, shape, verbose=F
         k2 = _velocity_at(pos + 0.5*dt*k1, kdtree, r_corners, fluxes, shape)
         k3 = _velocity_at(pos + 0.5*dt*k2, kdtree, r_corners, fluxes, shape)
         k4 = _velocity_at(pos +     dt*k3, kdtree, r_corners, fluxes, shape)
-        pos += (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        pos_new = pos + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        # Freeze any particle whose position has become non-finite (degenerate
+        # cell produced NaN velocity on a sub-step).
+        bad = ~np.isfinite(pos_new).all(axis=-1)
+        pos_new[bad] = pos[bad]
+        pos = pos_new
     return pos
 
 
@@ -460,6 +487,10 @@ class WrfFtle:
         self.cfl          = 0.25
         self.time_index   = 0
         self.rotate_winds = None      # None = auto-detect from MAP_PROJ
+        # Seeding/output sub-region (cell indices, inclusive).
+        # None means use the full domain extent.
+        self.imin = None;  self.imax = None
+        self.jmin = None;  self.jmax = None
         self.verbose      = False
 
     @staticmethod
@@ -540,24 +571,50 @@ class WrfFtle:
 
         t2 = time.perf_counter()
 
-        # ── seed at corner nodes ──────────────────────────────────────────
-        seeds = r_corners.reshape(-1, 3)
+        # ── resolve seed sub-region (cell indices, inclusive) ─────────────
+        # Velocity field and KD-tree always cover the FULL domain so that
+        # trajectories can leave the seed region freely.
+        imin = self.imin if self.imin is not None else 0
+        imax = self.imax if self.imax is not None else nx - 1
+        jmin = self.jmin if self.jmin is not None else 0
+        jmax = self.jmax if self.jmax is not None else ny - 1
+
+        # Clamp to valid cell range
+        imin = max(imin, 0);  imax = min(imax, nx - 1)
+        jmin = max(jmin, 0);  jmax = min(jmax, ny - 1)
+
+        if self.verbose:
+            print(f'Seed region: i={imin}..{imax}  j={jmin}..{jmax}  '
+                  f'(full domain: i=0..{nx-1}  j=0..{ny-1})')
+
+        # Corner sub-array for the seed region: cells imin..imax, jmin..jmax
+        # need corners imin..imax+1 in i and jmin..jmax+1 in j (all k).
+        rc_seed = r_corners[:, jmin:jmax+2, imin:imax+2, :]  # (nzp1, njs+1, nis+1, 3)
+        nzp1_s, nyp1_s, nxp1_s = rc_seed.shape[:3]
+
+        seeds = rc_seed.reshape(-1, 3)
         N = len(seeds)
         if self.verbose:
             print(f'Seed points: {N}')
 
-        # CFL-based step count
+        # CFL-based step count.
+        # Use the 5th-percentile cell edge length (not the minimum) so that a
+        # handful of degenerate near-surface cells do not dominate the step count.
         max_spd = max(float(np.nanmax(np.abs(U))),
                       float(np.nanmax(np.abs(V))),
                       float(np.nanmax(np.abs(W))))
-        edge_xi  = np.linalg.norm(
-            r_corners[:-1,:-1,1:] - r_corners[:-1,:-1,:-1], axis=-1)
-        h_min = max(float(edge_xi.min()), 1.0)
-        nsteps = max(int(max_spd * abs(self.tintegr) / h_min / self.cfl) + 1, 20)
+        edge_xi  = np.linalg.norm(r_corners[:-1,:-1, 1:] - r_corners[:-1,:-1,:-1], axis=-1)
+        edge_eta = np.linalg.norm(r_corners[:-1, 1:,:-1] - r_corners[:-1,:-1,:-1], axis=-1)
+        edge_zta = np.linalg.norm(r_corners[ 1:,:-1,:-1] - r_corners[:-1,:-1,:-1], axis=-1)
+        h_rep = float(np.percentile(np.concatenate([edge_xi.ravel(),
+                                                    edge_eta.ravel(),
+                                                    edge_zta.ravel()]), 5))
+        h_rep = max(h_rep, 1.0)
+        nsteps = max(int(max_spd * abs(self.tintegr) / h_rep / self.cfl) + 1, 20)
         dt = self.tintegr / nsteps
         if self.verbose:
-            print(f'max_speed={max_spd:.2f} m/s  h_min={h_min:.0f} m  '
-                  f'nsteps={nsteps}  dt={dt:.1f} s')
+            print(f'max_speed={max_spd:.2f} m/s  h_5pct={h_rep:.0f} m  '
+                  f'nsteps={nsteps}  dt={dt:.4f} s')
 
         t3 = time.perf_counter()
 
@@ -568,8 +625,8 @@ class WrfFtle:
         t4 = time.perf_counter()
 
         # ── FTLE ──────────────────────────────────────────────────────────
-        Xf   = final.reshape(nzp1, nyp1, nxp1, 3)
-        F    = gradient_curvilinear(Xf, r_corners)
+        Xf   = final.reshape(nzp1_s, nyp1_s, nxp1_s, 3)
+        F    = gradient_curvilinear(Xf, rc_seed)
         ftle = compute_ftle(F, self.tintegr)
 
         t5 = time.perf_counter()
@@ -578,7 +635,7 @@ class WrfFtle:
             print(f'Read {t1-t0:.2f}s  Build {t2-t1:.2f}s  '
                   f'Setup {t3-t2:.2f}s  RK4 {t4-t3:.2f}s  FTLE {t5-t4:.2f}s')
 
-        return dict(r_corners=r_corners, ftle=ftle)
+        return dict(r_corners=rc_seed, ftle=ftle)
 
     def visualise(self, result):
         import pyvista as pv
@@ -602,13 +659,17 @@ class WrfFtle:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
-         time_index=0, rotate_winds=None, visualise=False, verbose=False):
+         time_index=0, rotate_winds=None,
+         imin=None, imax=None, jmin=None, jmax=None,
+         visualise=False, verbose=False):
     wf = WrfFtle()
     wf.wrffile       = wrffile
     wf.tintegr       = tintegr
     wf.cfl           = cfl
     wf.time_index    = time_index
     wf.rotate_winds  = rotate_winds
+    wf.imin = imin;  wf.imax = imax
+    wf.jmin = jmin;  wf.jmax = jmax
     wf.verbose       = verbose
 
     result = wf.compute()
@@ -645,6 +706,14 @@ def build_parser():
     grp.add_argument('--no-rotate-winds', dest='rotate_winds', action='store_false',
                      help='Force no wind rotation')
     p.set_defaults(rotate_winds=None)  # None = auto-detect from MAP_PROJ
+    p.add_argument('--imin', type=int, default=None,
+                   help='Min west-east cell index for seeding (default: 0)')
+    p.add_argument('--imax', type=int, default=None,
+                   help='Max west-east cell index for seeding (default: nx-1)')
+    p.add_argument('--jmin', type=int, default=None,
+                   help='Min south-north cell index for seeding (default: 0)')
+    p.add_argument('--jmax', type=int, default=None,
+                   help='Max south-north cell index for seeding (default: ny-1)')
     p.add_argument('--visualise',     action='store_true')
     p.add_argument('--verbose',       action='store_true')
     return p
@@ -654,8 +723,10 @@ def cli():
     args = build_parser().parse_args()
     main(wrffile=args.wrffile, vtkout=args.vtkout, tintegr=args.tintegr,
          cfl=args.cfl, time_index=args.time_index,
-         rotate_winds=args.rotate_winds, visualise=args.visualise,
-         verbose=args.verbose)
+         rotate_winds=args.rotate_winds,
+         imin=args.imin, imax=args.imax,
+         jmin=args.jmin, jmax=args.jmax,
+         visualise=args.visualise, verbose=args.verbose)
 
 
 if __name__ == '__main__':
