@@ -47,9 +47,12 @@ MAP_PROJ values:
   6 – Lat/Lon                Earth-relative → rotate_winds = True
 """
 
+import math
+
 import numpy as np
 import xarray as xr
 from scipy.spatial import cKDTree
+from numba import njit, prange
 import argparse
 import time
 
@@ -172,6 +175,128 @@ def _trilinear_derivs(corners, xi, eta, zeta):
     dr_dzeta = ((1-a)*(1-b)*(r[:,4]-r[:,0]) +    a*(1-b)*(r[:,5]-r[:,1])
               +    a*   b*(r[:,6]-r[:,2]) + (1-a)*   b*(r[:,7]-r[:,3]))
     return dr_dxi, dr_deta, dr_dzeta
+
+
+# ── Numba-accelerated Newton iteration ───────────────────────────────────────
+
+@njit(cache=True)
+def _trilinear_map_nb(corners, a, b, c):
+    """Trilinear map for a single cell.  corners:(8,3), a/b/c scalars → (3,)."""
+    out = np.empty(3)
+    for d in range(3):
+        out[d] = ((1-a)*(1-b)*(1-c)*corners[0, d]
+               +     a*(1-b)*(1-c)*corners[1, d]
+               +     a*   b*(1-c)*corners[2, d]
+               +  (1-a)*  b*(1-c)*corners[3, d]
+               +  (1-a)*(1-b)*  c*corners[4, d]
+               +     a*(1-b)*  c*corners[5, d]
+               +     a*   b*  c*corners[6, d]
+               +  (1-a)*  b*  c*corners[7, d])
+    return out
+
+
+@njit(cache=True)
+def _trilinear_derivs_nb(corners, a, b, c):
+    """∂r/∂ξ, ∂r/∂η, ∂r/∂ζ for a single cell.  corners:(8,3) → three (3,)."""
+    dxi  = np.empty(3)
+    deta = np.empty(3)
+    dzt  = np.empty(3)
+    for d in range(3):
+        dxi[d]  = ((1-b)*(1-c)*(corners[1,d]-corners[0,d])
+                +     b*(1-c)*(corners[2,d]-corners[3,d])
+                +  (1-b)*  c*(corners[5,d]-corners[4,d])
+                +     b*   c*(corners[6,d]-corners[7,d]))
+        deta[d] = ((1-a)*(1-c)*(corners[3,d]-corners[0,d])
+                +     a*(1-c)*(corners[2,d]-corners[1,d])
+                +  (1-a)*  c*(corners[7,d]-corners[4,d])
+                +     a*   c*(corners[6,d]-corners[5,d]))
+        dzt[d]  = ((1-a)*(1-b)*(corners[4,d]-corners[0,d])
+                +     a*(1-b)*(corners[5,d]-corners[1,d])
+                +     a*   b*(corners[6,d]-corners[2,d])
+                +  (1-a)*  b*(corners[7,d]-corners[3,d]))
+    return dxi, deta, dzt
+
+
+@njit(parallel=True, cache=True)
+def _newton_bary(pos, k, j, i, r_corners, max_iter):
+    """
+    Refine barycentric coordinates via Newton iteration, one particle per thread.
+
+    pos       : (N, 3) float64
+    k, j, i   : (N,)   int64  — cell indices from KD-tree
+    r_corners : (nz+1, ny+1, nx+1, 3) float64
+    Returns xi, eta, zeta : (N,) float64
+    """
+    N = len(pos)
+    xi   = np.empty(N)
+    eta  = np.empty(N)
+    zeta = np.empty(N)
+
+    for n in prange(N):
+        kn = k[n];  jn = j[n];  in_ = i[n]
+
+        # Extract 8 corners for this cell into a local (8,3) array
+        corners = np.empty((8, 3))
+        for d in range(3):
+            corners[0, d] = r_corners[kn,   jn,   in_,   d]
+            corners[1, d] = r_corners[kn,   jn,   in_+1, d]
+            corners[2, d] = r_corners[kn,   jn+1, in_+1, d]
+            corners[3, d] = r_corners[kn,   jn+1, in_,   d]
+            corners[4, d] = r_corners[kn+1, jn,   in_,   d]
+            corners[5, d] = r_corners[kn+1, jn,   in_+1, d]
+            corners[6, d] = r_corners[kn+1, jn+1, in_+1, d]
+            corners[7, d] = r_corners[kn+1, jn+1, in_,   d]
+
+        a, b, c = 0.5, 0.5, 0.5
+
+        for _ in range(max_iter):
+            r_est = _trilinear_map_nb(corners, a, b, c)
+            resid0 = pos[n, 0] - r_est[0]
+            resid1 = pos[n, 1] - r_est[1]
+            resid2 = pos[n, 2] - r_est[2]
+
+            dr_dxi, dr_deta, dr_dzt = _trilinear_derivs_nb(corners, a, b, c)
+
+            # Jacobian matrix (columns = ∂r/∂ξ, ∂r/∂η, ∂r/∂ζ)
+            j00 = dr_dxi[0];  j10 = dr_dxi[1];  j20 = dr_dxi[2]
+            j01 = dr_deta[0]; j11 = dr_deta[1]; j21 = dr_deta[2]
+            j02 = dr_dzt[0];  j12 = dr_dzt[1];  j22 = dr_dzt[2]
+
+            det = (j00*(j11*j22 - j12*j21)
+                 - j01*(j10*j22 - j12*j20)
+                 + j02*(j10*j21 - j11*j20))
+
+            # Scale-invariant singularity guard: |det| vs product of column norms
+            col0 = math.sqrt(j00*j00 + j10*j10 + j20*j20)
+            col1 = math.sqrt(j01*j01 + j11*j11 + j21*j21)
+            col2 = math.sqrt(j02*j02 + j12*j12 + j22*j22)
+            if math.fabs(det) < 1e-6 * col0 * col1 * col2:
+                break   # degenerate cell — keep current estimate
+
+            # Cramer's rule (faster than linalg.solve for 3×3)
+            inv_det = 1.0 / det
+            d0 = inv_det * (resid0*(j11*j22-j12*j21)
+                          - j01*(resid1*j22-j12*resid2)
+                          + j02*(resid1*j21-j11*resid2))
+            d1 = inv_det * (j00*(resid1*j22-j12*resid2)
+                          - resid0*(j10*j22-j12*j20)
+                          + j02*(j10*resid2-resid1*j20))
+            d2 = inv_det * (j00*(j11*resid2-resid1*j21)
+                          - j01*(j10*resid2-resid1*j20)
+                          + resid0*(j10*j21-j11*j20))
+
+            a = min(max(a + d0, 0.0), 1.0)
+            b = min(max(b + d1, 0.0), 1.0)
+            c = min(max(c + d2, 0.0), 1.0)
+
+            if math.fabs(d0) + math.fabs(d1) + math.fabs(d2) < 3e-10:
+                break
+
+        xi[n]   = a
+        eta[n]  = b
+        zeta[n] = c
+
+    return xi, eta, zeta
 
 
 # ── face fluxes ───────────────────────────────────────────────────────────────
@@ -323,44 +448,20 @@ def build_cell_lookup(r_corners):
 def find_cell_and_bary(pos, kdtree, r_corners, shape, max_iter=8):
     """
     For each particle (N, 3) find cell (k,j,i) and barycentric (ξ,η,ζ)
-    via KD-tree nearest-cell + Newton iteration.
+    via KD-tree nearest-cell + Numba-parallel Newton iteration.
     """
     nz, ny, nx = shape
     _, idx = kdtree.query(pos)
-    k = np.clip(idx // (ny * nx),            0, nz-1)
-    j = np.clip((idx % (ny * nx)) // nx,     0, ny-1)
-    i = np.clip(idx % nx,                    0, nx-1)
+    k = np.clip(idx // (ny * nx),        0, nz-1).astype(np.int64)
+    j = np.clip((idx % (ny * nx)) // nx, 0, ny-1).astype(np.int64)
+    i = np.clip(idx % nx,                0, nx-1).astype(np.int64)
 
-    xi   = np.full(len(pos), 0.5)
-    eta  = np.full(len(pos), 0.5)
-    zeta = np.full(len(pos), 0.5)
-    corners = _get_cell_corners(r_corners, k, j, i)   # (N, 8, 3)
-
-    for _ in range(max_iter):
-        r_est = _trilinear_map(corners, xi, eta, zeta)
-        resid = pos - r_est                            # (N, 3)
-        dxi, det, dzt = _trilinear_derivs(corners, xi, eta, zeta)
-        Jmat = np.stack([dxi, det, dzt], axis=-1)     # (N, 3, 3) columns=∂r/∂s
-
-        # In Cartesian coordinates a non-degenerate cell must have a non-singular
-        # Jacobian.  Near-zero determinants indicate genuinely degenerate cells
-        # in WRF's terrain-following grid (e.g. near-surface η-levels that are
-        # essentially zero-thickness over steep terrain).  Skip those cells —
-        # barycentric coords stay at their current estimate.
-        jdet  = np.linalg.det(Jmat)                   # (N,)
-        j_rms = np.sqrt(np.mean(jdet[np.isfinite(jdet)]**2))
-        ok    = np.abs(jdet) > 1e-6 * j_rms           # relative threshold
-        d     = np.zeros_like(resid)
-        if ok.any():
-            d[ok] = np.linalg.solve(
-                Jmat[ok], resid[ok, :, np.newaxis])[..., 0]
-
-        xi   = np.clip(xi   + d[:, 0], 0.0, 1.0)
-        eta  = np.clip(eta  + d[:, 1], 0.0, 1.0)
-        zeta = np.clip(zeta + d[:, 2], 0.0, 1.0)
-        if np.max(np.abs(d)) < 1e-10:
-            break
-
+    xi, eta, zeta = _newton_bary(
+        np.ascontiguousarray(pos,       dtype=np.float64),
+        k, j, i,
+        np.ascontiguousarray(r_corners, dtype=np.float64),
+        max_iter,
+    )
     return k, j, i, xi, eta, zeta
 
 
