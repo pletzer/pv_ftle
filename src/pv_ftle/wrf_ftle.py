@@ -491,6 +491,7 @@ class WrfFtle:
         self.imax         = None
         self.jmin         = None
         self.jmax         = None
+        self.checksum     = False
         self.verbose      = False
 
     @staticmethod
@@ -622,6 +623,21 @@ class WrfFtle:
             print(f'Read {t1-t0:.2f}s  Build {t2-t1:.2f}s  '
                   f'Setup {t3-t2:.2f}s  RK4 {t4-t3:.2f}s  FTLE {t5-t4:.2f}s')
 
+        if self.checksum:
+            import hashlib
+            def _cksum(arr, name):
+                # Stable byte-level checksum (little-endian float64) + simple stats
+                b = np.ascontiguousarray(arr, dtype=np.float64).tobytes()
+                md5 = hashlib.md5(b).hexdigest()
+                fin = arr[np.isfinite(arr)]
+                print(f'  {name:20s}  shape={arr.shape}  '
+                      f'min={fin.min():.6g}  max={fin.max():.6g}  '
+                      f'mean={fin.mean():.6g}  md5={md5}')
+            print('── checksum ──────────────────────────────────────────────')
+            _cksum(rc_seed, 'r_corners')
+            _cksum(ftle,    'ftle')
+            print('──────────────────────────────────────────────────────────')
+
         return dict(r_corners=rc_seed, ftle=ftle)
 
     def visualise(self, result):
@@ -647,7 +663,7 @@ class WrfFtle:
 
 def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
          time_index=0, rotate_winds=None, imin=None, imax=None, jmin=None,
-         jmax=None, visualise=False, verbose=False):
+         jmax=None, checksum=False, visualise=False, verbose=False):
     wf = WrfFtle()
     wf.wrffile       = wrffile
     wf.tintegr       = tintegr
@@ -658,6 +674,7 @@ def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     wf.imax          = imax
     wf.jmin          = jmin
     wf.jmax          = jmax
+    wf.checksum      = checksum
     wf.verbose       = verbose
 
     result = wf.compute()
@@ -702,6 +719,8 @@ def build_parser():
                    help='First j cell index for seed region (default: 0)')
     p.add_argument('--jmax',          type=int, default=None,
                    help='Last j cell index for seed region (default: ny-1)')
+    p.add_argument('--checksum',      action='store_true',
+                   help='Print MD5 + stats for r_corners and ftle (reproducibility check)')
     p.add_argument('--visualise',     action='store_true')
     p.add_argument('--verbose',       action='store_true')
     return p
@@ -713,7 +732,7 @@ def cli():
          cfl=args.cfl, time_index=args.time_index,
          rotate_winds=args.rotate_winds,
          imin=args.imin, imax=args.imax, jmin=args.jmin, jmax=args.jmax,
-         visualise=args.visualise, verbose=args.verbose)
+         checksum=args.checksum, visualise=args.visualise, verbose=args.verbose)
 
 
 if __name__ == '__main__':
