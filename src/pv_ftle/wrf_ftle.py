@@ -217,86 +217,172 @@ def _trilinear_derivs_nb(corners, a, b, c):
     return dxi, deta, dzt
 
 
-@njit(parallel=True, cache=True)
-def _newton_bary(pos, k, j, i, r_corners, max_iter):
+@njit(cache=True)
+def _get_corners_nb(r_corners, kn, jn, in_):
+    """Extract the 8 corner positions of cell (kn, jn, in_) into a (8, 3) array."""
+    corners = np.empty((8, 3))
+    for d in range(3):
+        corners[0, d] = r_corners[kn,   jn,   in_,   d]
+        corners[1, d] = r_corners[kn,   jn,   in_+1, d]
+        corners[2, d] = r_corners[kn,   jn+1, in_+1, d]
+        corners[3, d] = r_corners[kn,   jn+1, in_,   d]
+        corners[4, d] = r_corners[kn+1, jn,   in_,   d]
+        corners[5, d] = r_corners[kn+1, jn,   in_+1, d]
+        corners[6, d] = r_corners[kn+1, jn+1, in_+1, d]
+        corners[7, d] = r_corners[kn+1, jn+1, in_,   d]
+    return corners
+
+
+@njit(cache=True)
+def _newton_in_cell(pos_n, corners, max_iter):
     """
-    Refine barycentric coordinates via Newton iteration, one particle per thread.
+    Newton iteration for one particle inside one specific cell.
+
+    pos_n   : (3,)   particle Cartesian position
+    corners : (8, 3) cell corner positions
+    Returns (xi, eta, zeta, residual_squared).
+
+    Barycentric coords are clamped to [0, 1]; the residual_squared measures
+    how far the clamped point is from pos_n — zero means the particle is
+    genuinely inside this cell.
+    """
+    a, b, c = 0.5, 0.5, 0.5
+
+    for _ in range(max_iter):
+        r_est = _trilinear_map_nb(corners, a, b, c)
+        resid0 = pos_n[0] - r_est[0]
+        resid1 = pos_n[1] - r_est[1]
+        resid2 = pos_n[2] - r_est[2]
+
+        dr_dxi, dr_deta, dr_dzt = _trilinear_derivs_nb(corners, a, b, c)
+
+        j00 = dr_dxi[0];  j10 = dr_dxi[1];  j20 = dr_dxi[2]
+        j01 = dr_deta[0]; j11 = dr_deta[1]; j21 = dr_deta[2]
+        j02 = dr_dzt[0];  j12 = dr_dzt[1];  j22 = dr_dzt[2]
+
+        det = (j00*(j11*j22 - j12*j21)
+             - j01*(j10*j22 - j12*j20)
+             + j02*(j10*j21 - j11*j20))
+
+        col0 = math.sqrt(j00*j00 + j10*j10 + j20*j20)
+        col1 = math.sqrt(j01*j01 + j11*j11 + j21*j21)
+        col2 = math.sqrt(j02*j02 + j12*j12 + j22*j22)
+        if math.fabs(det) < 1e-6 * col0 * col1 * col2:
+            break
+
+        inv_det = 1.0 / det
+        d0 = inv_det * (resid0*(j11*j22-j12*j21)
+                      - j01*(resid1*j22-j12*resid2)
+                      + j02*(resid1*j21-j11*resid2))
+        d1 = inv_det * (j00*(resid1*j22-j12*resid2)
+                      - resid0*(j10*j22-j12*j20)
+                      + j02*(j10*resid2-resid1*j20))
+        d2 = inv_det * (j00*(j11*resid2-resid1*j21)
+                      - j01*(j10*resid2-resid1*j20)
+                      + resid0*(j10*j21-j11*j20))
+
+        a = min(max(a + d0, 0.0), 1.0)
+        b = min(max(b + d1, 0.0), 1.0)
+        c = min(max(c + d2, 0.0), 1.0)
+
+        if math.fabs(d0) + math.fabs(d1) + math.fabs(d2) < 3e-10:
+            break
+
+    r_est = _trilinear_map_nb(corners, a, b, c)
+    resid_sq = ((pos_n[0] - r_est[0])**2
+              + (pos_n[1] - r_est[1])**2
+              + (pos_n[2] - r_est[2])**2)
+    return a, b, c, resid_sq
+
+
+@njit(parallel=True, cache=True)
+def _newton_bary(pos, k, j, i, r_corners, nz, ny, nx, max_iter):
+    """
+    Parallel Newton iteration with neighbour-cell walk.
 
     pos       : (N, 3) float64
-    k, j, i   : (N,)   int64  — cell indices from KD-tree
+    k, j, i   : (N,)   int64  — starting cell hints
     r_corners : (nz+1, ny+1, nx+1, 3) float64
-    Returns xi, eta, zeta : (N,) float64
+    nz, ny, nx: grid cell counts (int64)
+
+    For each particle, Newton is first attempted in the hinted cell.  If any
+    barycentric coordinate is pinned to 0 or 1 (particle tried to leave the
+    cell), the six face-neighbours are tried in order and the one with the
+    smallest residual is accepted.  With CFL ≤ 0.25 at most one face is ever
+    crossed per call, so a single walk step is always sufficient.
+
+    Returns xi, eta, zeta, k_out, j_out, i_out : (N,) each.
+    The returned k/j/i reflect any cell that was walked into, so callers can
+    use them as warm hints for the next call.
     """
     N = len(pos)
-    xi   = np.empty(N)
-    eta  = np.empty(N)
-    zeta = np.empty(N)
+    xi_out   = np.empty(N)
+    eta_out  = np.empty(N)
+    zeta_out = np.empty(N)
+    k_out = k.copy()
+    j_out = j.copy()
+    i_out = i.copy()
+
+    FACE_TOL = 1e-8   # bary coord is considered "on the face" if within this of 0 or 1
 
     for n in prange(N):
         kn = k[n];  jn = j[n];  in_ = i[n]
 
-        # Extract 8 corners for this cell into a local (8,3) array
-        corners = np.empty((8, 3))
-        for d in range(3):
-            corners[0, d] = r_corners[kn,   jn,   in_,   d]
-            corners[1, d] = r_corners[kn,   jn,   in_+1, d]
-            corners[2, d] = r_corners[kn,   jn+1, in_+1, d]
-            corners[3, d] = r_corners[kn,   jn+1, in_,   d]
-            corners[4, d] = r_corners[kn+1, jn,   in_,   d]
-            corners[5, d] = r_corners[kn+1, jn,   in_+1, d]
-            corners[6, d] = r_corners[kn+1, jn+1, in_+1, d]
-            corners[7, d] = r_corners[kn+1, jn+1, in_,   d]
+        corners = _get_corners_nb(r_corners, kn, jn, in_)
+        a, b, c, resid_sq = _newton_in_cell(pos[n], corners, max_iter)
 
-        a, b, c = 0.5, 0.5, 0.5
+        # ── neighbour walk ───────────────────────────────────────────────────
+        # If a bary coord is pinned to a face (0 or 1) the particle may have
+        # crossed into the adjacent cell.  Try the neighbour; accept it if its
+        # residual is smaller (particle is genuinely inside that cell).
+        # We try all 6 faces but stop as soon as one walk succeeds, since CFL
+        # guarantees at most one face crossing per step.
+        walked = False
 
-        for _ in range(max_iter):
-            r_est = _trilinear_map_nb(corners, a, b, c)
-            resid0 = pos[n, 0] - r_est[0]
-            resid1 = pos[n, 1] - r_est[1]
-            resid2 = pos[n, 2] - r_est[2]
+        if not walked and a > 1.0 - FACE_TOL and in_ < nx - 1:
+            nbr = _get_corners_nb(r_corners, kn, jn, in_ + 1)
+            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
+            if rz < resid_sq:
+                a, b, c, resid_sq = az, bz, cz, rz;  in_ += 1;  walked = True
 
-            dr_dxi, dr_deta, dr_dzt = _trilinear_derivs_nb(corners, a, b, c)
+        if not walked and a < FACE_TOL and in_ > 0:
+            nbr = _get_corners_nb(r_corners, kn, jn, in_ - 1)
+            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
+            if rz < resid_sq:
+                a, b, c, resid_sq = az, bz, cz, rz;  in_ -= 1;  walked = True
 
-            # Jacobian matrix (columns = ∂r/∂ξ, ∂r/∂η, ∂r/∂ζ)
-            j00 = dr_dxi[0];  j10 = dr_dxi[1];  j20 = dr_dxi[2]
-            j01 = dr_deta[0]; j11 = dr_deta[1]; j21 = dr_deta[2]
-            j02 = dr_dzt[0];  j12 = dr_dzt[1];  j22 = dr_dzt[2]
+        if not walked and b > 1.0 - FACE_TOL and jn < ny - 1:
+            nbr = _get_corners_nb(r_corners, kn, jn + 1, in_)
+            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
+            if rz < resid_sq:
+                a, b, c, resid_sq = az, bz, cz, rz;  jn += 1;  walked = True
 
-            det = (j00*(j11*j22 - j12*j21)
-                 - j01*(j10*j22 - j12*j20)
-                 + j02*(j10*j21 - j11*j20))
+        if not walked and b < FACE_TOL and jn > 0:
+            nbr = _get_corners_nb(r_corners, kn, jn - 1, in_)
+            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
+            if rz < resid_sq:
+                a, b, c, resid_sq = az, bz, cz, rz;  jn -= 1;  walked = True
 
-            # Scale-invariant singularity guard: |det| vs product of column norms
-            col0 = math.sqrt(j00*j00 + j10*j10 + j20*j20)
-            col1 = math.sqrt(j01*j01 + j11*j11 + j21*j21)
-            col2 = math.sqrt(j02*j02 + j12*j12 + j22*j22)
-            if math.fabs(det) < 1e-6 * col0 * col1 * col2:
-                break   # degenerate cell — keep current estimate
+        if not walked and c > 1.0 - FACE_TOL and kn < nz - 1:
+            nbr = _get_corners_nb(r_corners, kn + 1, jn, in_)
+            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
+            if rz < resid_sq:
+                a, b, c, resid_sq = az, bz, cz, rz;  kn += 1;  walked = True
 
-            # Cramer's rule (faster than linalg.solve for 3×3)
-            inv_det = 1.0 / det
-            d0 = inv_det * (resid0*(j11*j22-j12*j21)
-                          - j01*(resid1*j22-j12*resid2)
-                          + j02*(resid1*j21-j11*resid2))
-            d1 = inv_det * (j00*(resid1*j22-j12*resid2)
-                          - resid0*(j10*j22-j12*j20)
-                          + j02*(j10*resid2-resid1*j20))
-            d2 = inv_det * (j00*(j11*resid2-resid1*j21)
-                          - j01*(j10*resid2-resid1*j20)
-                          + resid0*(j10*j21-j11*j20))
+        if not walked and c < FACE_TOL and kn > 0:
+            nbr = _get_corners_nb(r_corners, kn - 1, jn, in_)
+            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
+            if rz < resid_sq:
+                a, b, c = az, bz, cz;  kn -= 1
 
-            a = min(max(a + d0, 0.0), 1.0)
-            b = min(max(b + d1, 0.0), 1.0)
-            c = min(max(c + d2, 0.0), 1.0)
+        xi_out[n]   = a
+        eta_out[n]  = b
+        zeta_out[n] = c
+        k_out[n]    = kn
+        j_out[n]    = jn
+        i_out[n]    = in_
 
-            if math.fabs(d0) + math.fabs(d1) + math.fabs(d2) < 3e-10:
-                break
-
-        xi[n]   = a
-        eta[n]  = b
-        zeta[n] = c
-
-    return xi, eta, zeta
+    return xi_out, eta_out, zeta_out, k_out, j_out, i_out
 
 
 # ── face fluxes ───────────────────────────────────────────────────────────────
@@ -445,21 +531,34 @@ def build_cell_lookup(r_corners):
     return flat, cKDTree(flat), (nz, ny, nx)
 
 
-def find_cell_and_bary(pos, kdtree, r_corners, shape, max_iter=8):
+def find_cell_and_bary(pos, kdtree, r_corners, shape,
+                       k_hint=None, j_hint=None, i_hint=None, max_iter=8):
     """
-    For each particle (N, 3) find cell (k,j,i) and barycentric (ξ,η,ζ)
-    via KD-tree nearest-cell + Numba-parallel Newton iteration.
+    For each particle (N, 3) find cell (k,j,i) and barycentric (ξ,η,ζ).
+
+    If k_hint/j_hint/i_hint are supplied the KD-tree query is skipped and
+    Newton iteration starts from those cell indices.  This is valid whenever
+    the new positions are guaranteed to be close to the hinted cells — i.e.
+    when the CFL condition limits each displacement to a fraction of a cell.
+
+    Without hints a full KD-tree query is performed (needed on the very first
+    call, or as a periodic correction).
     """
     nz, ny, nx = shape
-    _, idx = kdtree.query(pos)
-    k = np.clip(idx // (ny * nx),        0, nz-1).astype(np.int64)
-    j = np.clip((idx % (ny * nx)) // nx, 0, ny-1).astype(np.int64)
-    i = np.clip(idx % nx,                0, nx-1).astype(np.int64)
 
-    xi, eta, zeta = _newton_bary(
+    if k_hint is None:
+        _, idx = kdtree.query(pos)
+        k = np.clip(idx // (ny * nx),        0, nz-1).astype(np.int64)
+        j = np.clip((idx % (ny * nx)) // nx, 0, ny-1).astype(np.int64)
+        i = np.clip(idx % nx,                0, nx-1).astype(np.int64)
+    else:
+        k, j, i = k_hint, j_hint, i_hint
+
+    xi, eta, zeta, k, j, i = _newton_bary(
         np.ascontiguousarray(pos,       dtype=np.float64),
         k, j, i,
         np.ascontiguousarray(r_corners, dtype=np.float64),
+        np.int64(nz), np.int64(ny), np.int64(nx),
         max_iter,
     )
     return k, j, i, xi, eta, zeta
@@ -476,11 +575,14 @@ def _phi_at(fluxes, k, j, i):
 
 # ── RK4 integrator ────────────────────────────────────────────────────────────
 
-def _velocity_at(pos, kdtree, r_corners, fluxes, shape):
-    k, j, i, xi, eta, zeta = find_cell_and_bary(pos, kdtree, r_corners, shape)
+def _velocity_at(pos, kdtree, r_corners, fluxes, shape,
+                 k_hint=None, j_hint=None, i_hint=None):
+    """Return (velocity, k, j, i) so callers can reuse the cell indices."""
+    k, j, i, xi, eta, zeta = find_cell_and_bary(
+        pos, kdtree, r_corners, shape, k_hint, j_hint, i_hint)
     phi     = _phi_at(fluxes, k, j, i)
     corners = _get_cell_corners(r_corners, k, j, i)
-    return reconstruct_velocity(xi, eta, zeta, phi, corners)
+    return reconstruct_velocity(xi, eta, zeta, phi, corners), k, j, i
 
 
 def integrate_rk4(seeds, dt, nsteps, kdtree, r_corners, fluxes, shape, verbose=False):
@@ -492,21 +594,44 @@ def integrate_rk4(seeds, dt, nsteps, kdtree, r_corners, fluxes, shape, verbose=F
     nsteps : int
 
     Returns (N, 3) final positions.
+
+    KD-tree usage
+    -------------
+    The KD-tree query is called only once — for the very first k1 evaluation.
+    All subsequent cell lookups (k2, k3, k4 within a step, and k1 of every
+    following step) reuse the cell indices from the previous call and skip
+    the KD-tree, going straight to Newton iteration.
+
+    This is valid because the CFL condition guarantees that each sub-step
+    displacement is at most 0.5 × CFL × h ≈ 0.125 h, and each full-step
+    displacement is at most CFL × h = 0.25 h.  Newton converges in one or
+    two iterations when the starting cell is the correct one or a face
+    neighbour, so the warm start is both fast and accurate.
     """
     pos = seeds.copy()
+    kc = jc = ic = None   # None → KD-tree on the first call only
+
     for step in range(nsteps):
         if verbose and step % max(1, nsteps//10) == 0:
             print(f'  RK4 step {step}/{nsteps}')
-        k1 = _velocity_at(pos,              kdtree, r_corners, fluxes, shape)
-        k2 = _velocity_at(pos + 0.5*dt*k1, kdtree, r_corners, fluxes, shape)
-        k3 = _velocity_at(pos + 0.5*dt*k2, kdtree, r_corners, fluxes, shape)
-        k4 = _velocity_at(pos +     dt*k3, kdtree, r_corners, fluxes, shape)
-        pos_new = pos + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-        # Freeze any particle whose position has become non-finite (degenerate
-        # cell produced NaN velocity on a sub-step).
+
+        # k1 — warm Newton from previous step's cell (KD-tree only on step 0)
+        v1, kc, jc, ic = _velocity_at(pos,              kdtree, r_corners, fluxes, shape,
+                                       kc, jc, ic)
+        # k2, k3, k4 — warm Newton from k1's cell (sub-step displacement ≤ 0.125 h)
+        v2, *_ = _velocity_at(pos + 0.5*dt*v1, kdtree, r_corners, fluxes, shape,
+                               kc, jc, ic)
+        v3, *_ = _velocity_at(pos + 0.5*dt*v2, kdtree, r_corners, fluxes, shape,
+                               kc, jc, ic)
+        v4, *_ = _velocity_at(pos +     dt*v3, kdtree, r_corners, fluxes, shape,
+                               kc, jc, ic)
+
+        pos_new = pos + (dt / 6.0) * (v1 + 2*v2 + 2*v3 + v4)
+        # Freeze any particle whose position became non-finite.
         bad = ~np.isfinite(pos_new).all(axis=-1)
         pos_new[bad] = pos[bad]
         pos = pos_new
+
     return pos
 
 
@@ -741,22 +866,34 @@ class WrfFtle:
 
         return dict(r_corners=rc_seed, ftle=ftle)
 
-    def visualise(self, result):
+    def visualise(self, result, level=0):
+        """
+        Show FTLE for a single vertical level on the curvilinear grid.
+
+        level : int  k-index into the nz cell layers (0 = bottom, nz-1 = top).
+                Negative indices are supported (e.g. -1 = top layer).
+        """
         import pyvista as pv
         rc   = result['r_corners']
         ftle = result['ftle']
         nzp1, nyp1, nxp1 = rc.shape[:3]
+        nz = nzp1 - 1
 
-        # Show bottom layer on the sphere
+        # Normalise negative index
+        k = int(level) % nz
+
+        # 2-D StructuredGrid: corners of level k, dimensions (nxp1, nyp1, 1)
+        # rc[k] and rc[k+1] are the bottom and top corner sheets of layer k;
+        # use the bottom sheet as the representative surface.
         g = pv.StructuredGrid()
         g.dimensions = (nxp1, nyp1, 1)
-        g.points = rc[0].reshape(-1, 3)
-        g.cell_data['FTLE (s⁻¹)'] = ftle[0].ravel(order='C')
+        g.points     = np.ascontiguousarray(rc[k].reshape(-1, 3))
+        g.cell_data['FTLE (s⁻¹)'] = ftle[k].ravel(order='C')
 
         pl = pv.Plotter()
         pl.add_mesh(g, scalars='FTLE (s⁻¹)', cmap='hot_r',
                     scalar_bar_args={'title': 'FTLE (s⁻¹)'})
-        pl.add_text('WRF FTLE – bottom layer', font_size=12)
+        pl.add_text(f'WRF FTLE – level {k} of {nz}', font_size=12)
         pl.show()
 
 
@@ -764,7 +901,7 @@ class WrfFtle:
 
 def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
          time_index=0, rotate_winds=None, imin=None, imax=None, jmin=None,
-         jmax=None, checksum=False, visualise=False, verbose=False):
+         jmax=None, checksum=False, visualise=False, level=0, verbose=False):
     wf = WrfFtle()
     wf.wrffile       = wrffile
     wf.tintegr       = tintegr
@@ -781,7 +918,7 @@ def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     result = wf.compute()
 
     if visualise:
-        wf.visualise(result)
+        wf.visualise(result, level=level)
 
     # Write full 3-D VTK StructuredGrid
     import pyvista as pv
@@ -820,10 +957,13 @@ def build_parser():
                    help='First j cell index for seed region (default: 300)')
     p.add_argument('--jmax',          type=int, default=320,
                    help='Last j cell index for seed region (default: 320)')
-    p.add_argument('--checksum',      action='store_true',
+    p.add_argument('--checksum',       action='store_true',
                    help='Print MD5 + stats for r_corners and ftle (reproducibility check)')
-    p.add_argument('--visualise',     action='store_true')
-    p.add_argument('--verbose',       action='store_true')
+    p.add_argument('--visualise',      action='store_true')
+    p.add_argument('--level',          type=int, default=0,
+                   help='Vertical level (k index) to visualise (default: 0 = bottom; '
+                        'negative indices count from the top, e.g. -1 = top layer)')
+    p.add_argument('--verbose',        action='store_true')
     return p
 
 
@@ -833,7 +973,8 @@ def cli():
          cfl=args.cfl, time_index=args.time_index,
          rotate_winds=args.rotate_winds,
          imin=args.imin, imax=args.imax, jmin=args.jmin, jmax=args.jmax,
-         checksum=args.checksum, visualise=args.visualise, verbose=args.verbose)
+         checksum=args.checksum, visualise=args.visualise,
+         level=args.level, verbose=args.verbose)
 
 
 if __name__ == '__main__':
