@@ -293,6 +293,15 @@ class WrfFtleIdx:
         imax = self.imax if self.imax is not None else nx - 1
         jmin = self.jmin if self.jmin is not None else 0
         jmax = self.jmax if self.jmax is not None else ny - 1
+        # Support Python-style negative indices (e.g. --imax=-100 → nx-100)
+        if imin < 0: imin = nx + imin
+        if imax < 0: imax = nx + imax
+        if jmin < 0: jmin = ny + jmin
+        if jmax < 0: jmax = ny + jmax
+        imin = max(0, min(imin, nx - 1))
+        imax = max(0, min(imax, nx - 1))
+        jmin = max(0, min(jmin, ny - 1))
+        jmax = max(0, min(jmax, ny - 1))
 
         # Seed corners in reference space: corner (kp, jp, ip) → (p=ip, q=jp, r=kp)
         ip = np.arange(imin,  imax + 2, dtype=np.float64)   # nxp1_seed = imax-imin+2
