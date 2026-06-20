@@ -718,6 +718,7 @@ class WrfFtle:
         self.jmin         = None
         self.jmax         = None
         self.checksum     = False
+        self.cmax         = None      # colour scale max (min fixed at 0); None = data-driven
         self.verbose      = False
 
     @staticmethod
@@ -875,12 +876,14 @@ class WrfFtle:
 
         return dict(r_corners=rc_seed, ftle=ftle)
 
-    def visualise(self, result, level=0):
+    def visualise(self, result, level=0, cmax=None):
         """
-        Show FTLE for a single vertical level on the curvilinear grid.
+        Interactive level viewer.
 
-        level : int  k-index into the nz cell layers (0 = bottom, nz-1 = top).
-                Negative indices are supported (e.g. -1 = top layer).
+        Press 'z' / 'Z' to step down / up through vertical levels.
+
+        level : int    starting k-index (0 = bottom; negative counts from top)
+        cmax  : float  colour scale maximum (min fixed at 0); None = data-driven
         """
         import pyvista as pv
         rc   = result['r_corners']
@@ -888,21 +891,39 @@ class WrfFtle:
         nzp1, nyp1, nxp1 = rc.shape[:3]
         nz = nzp1 - 1
 
-        # Normalise negative index
-        k = int(level) % nz
+        clim = [0.0, float(cmax)] if cmax is not None else None
 
-        # 2-D StructuredGrid: corners of level k, dimensions (nxp1, nyp1, 1)
-        # rc[k] and rc[k+1] are the bottom and top corner sheets of layer k;
-        # use the bottom sheet as the representative surface.
-        g = pv.StructuredGrid()
-        g.dimensions = (nxp1, nyp1, 1)
-        g.points     = np.ascontiguousarray(rc[k].reshape(-1, 3))
-        g.cell_data['FTLE (s⁻¹)'] = ftle[k].ravel(order='C')
+        def make_grid(k):
+            g = pv.StructuredGrid()
+            g.dimensions = (nxp1, nyp1, 1)
+            g.points = np.ascontiguousarray(rc[k].reshape(-1, 3))
+            g.cell_data['FTLE (s⁻¹)'] = ftle[k].ravel(order='C')
+            return g
+
+        state = {'k': int(level) % nz}
 
         pl = pv.Plotter()
-        pl.add_mesh(g, scalars='FTLE (s⁻¹)', cmap='hot_r',
-                    scalar_bar_args={'title': 'FTLE (s⁻¹)'})
-        pl.add_text(f'WRF FTLE – level {k} of {nz}', font_size=12)
+
+        def refresh():
+            k = state['k']
+            pl.add_mesh(make_grid(k), name='ftle_surface', scalars='FTLE (s⁻¹)',
+                        cmap='hot_r', clim=clim,
+                        scalar_bar_args={'title': 'FTLE (s⁻¹)'})
+            pl.add_text(f'WRF FTLE – level {k} of {nz}  [z/Z = down/up]',
+                        font_size=12, name='level_text')
+            pl.render()
+
+        def step_down():
+            state['k'] = (state['k'] - 1) % nz
+            refresh()
+
+        def step_up():
+            state['k'] = (state['k'] + 1) % nz
+            refresh()
+
+        pl.add_key_event('z', step_down)
+        pl.add_key_event('Z', step_up)
+        refresh()
         pl.show()
 
 
@@ -910,7 +931,8 @@ class WrfFtle:
 
 def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
          time_index=0, rotate_winds=None, imin=None, imax=None, jmin=None,
-         jmax=None, checksum=False, visualise=False, level=0, verbose=False):
+         jmax=None, checksum=False, visualise=False, level=0, cmax=None,
+         verbose=False):
     wf = WrfFtle()
     wf.wrffile       = wrffile
     wf.tintegr       = tintegr
@@ -922,12 +944,13 @@ def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     wf.jmin          = jmin
     wf.jmax          = jmax
     wf.checksum      = checksum
+    wf.cmax          = cmax
     wf.verbose       = verbose
 
     result = wf.compute()
 
     if visualise:
-        wf.visualise(result, level=level)
+        wf.visualise(result, level=level, cmax=cmax)
 
     # Write full 3-D VTK StructuredGrid
     import pyvista as pv
@@ -970,8 +993,11 @@ def build_parser():
                    help='Print MD5 + stats for r_corners and ftle (reproducibility check)')
     p.add_argument('--visualise',      action='store_true')
     p.add_argument('--level',          type=int, default=0,
-                   help='Vertical level (k index) to visualise (default: 0 = bottom; '
-                        'negative indices count from the top, e.g. -1 = top layer)')
+                   help='Starting vertical level (k index) for visualisation '
+                        '(default: 0 = bottom; negative counts from top)')
+    p.add_argument('--cmax',           type=float, default=None,
+                   help='Colour scale maximum for FTLE (min fixed at 0); '
+                        'default: data-driven per frame')
     p.add_argument('--verbose',        action='store_true')
     return p
 
@@ -983,7 +1009,7 @@ def cli():
          rotate_winds=args.rotate_winds,
          imin=args.imin, imax=args.imax, jmin=args.jmin, jmax=args.jmax,
          checksum=args.checksum, visualise=args.visualise,
-         level=args.level, verbose=args.verbose)
+         level=args.level, cmax=args.cmax, verbose=args.verbose)
 
 
 if __name__ == '__main__':
