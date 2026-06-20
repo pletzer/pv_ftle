@@ -802,7 +802,7 @@ def build_parser():
         description='Compute FTLE from WRF output using mimetic velocity reconstruction.')
     p.add_argument('wrffile')
     p.add_argument('--vtkout',        default='wrf_ftle.vts')
-    p.add_argument('--tintegr',       type=float, default=-3600.0,
+    p.add_argument('--tintegr',       type=float, default=-10.0,
                    help='Integration time in seconds (negative=backward)')
     p.add_argument('--cfl',           type=float, default=0.25)
     p.add_argument('--time-index',    type=int,   default=0)
@@ -812,14 +812,14 @@ def build_parser():
     grp.add_argument('--no-rotate-winds', dest='rotate_winds', action='store_false',
                      help='Force no wind rotation')
     p.set_defaults(rotate_winds=None)  # None = auto-detect from MAP_PROJ
-    p.add_argument('--imin',          type=int, default=None,
-                   help='First i cell index for seed region (default: 0)')
-    p.add_argument('--imax',          type=int, default=None,
-                   help='Last i cell index for seed region (default: nx-1)')
-    p.add_argument('--jmin',          type=int, default=None,
-                   help='First j cell index for seed region (default: 0)')
-    p.add_argument('--jmax',          type=int, default=None,
-                   help='Last j cell index for seed region (default: ny-1)')
+    p.add_argument('--imin',          type=int, default=200,
+                   help='First i cell index for seed region (default: 200)')
+    p.add_argument('--imax',          type=int, default=220,
+                   help='Last i cell index for seed region (default: 220)')
+    p.add_argument('--jmin',          type=int, default=300,
+                   help='First j cell index for seed region (default: 300)')
+    p.add_argument('--jmax',          type=int, default=320,
+                   help='Last j cell index for seed region (default: 320)')
     p.add_argument('--checksum',      action='store_true',
                    help='Print MD5 + stats for r_corners and ftle (reproducibility check)')
     p.add_argument('--visualise',     action='store_true')
