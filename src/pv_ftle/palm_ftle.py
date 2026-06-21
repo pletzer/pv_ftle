@@ -116,6 +116,7 @@ class PalmFtle:
         self.time_index = 0
         self.frozen = False
         self.checksum = True
+        self.zero_fill = True
 
         self.verbose = False
 
@@ -221,6 +222,7 @@ NetCDF variable names:
             self.palmfile,
             tmin=float(t_all[tmin_idx]),
             tmax=float(t_all[tmax_idx - 1]),
+            zero_fill=self.zero_fill,
         )
         xaxis_full, yaxis_full, zaxis = reader.getAxes()
         t_axis = reader.getTimeAxis()
@@ -368,9 +370,10 @@ time eigenvalue:  {tm5 - tm4:.3f} sec
             ftle=ftle,
         )
 
-def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cfl:float=0.25, 
-         imin: int=1, imax: int=-2, jmin: int=1, jmax: int=-2, 
-         time_index: int=0, frozen: bool=False, checksum: bool=False, verbose: bool=False):
+def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cfl:float=0.25,
+         imin: int=1, imax: int=-2, jmin: int=1, jmax: int=-2,
+         time_index: int=0, frozen: bool=False, checksum: bool=False,
+         zero_fill: bool=True, verbose: bool=False):
     """
     Compute the Finite Time Lyapunov Exponent
 
@@ -385,6 +388,7 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     @param time_index select time index
     @param frozen whether to freeze the velocity while computing the trajectories
     @param checksum whether to compute a checksum
+    @param zero_fill replace masked fill values (e.g. -9999 building cells) with zero
     @param verbose to print messages
     """
     pf = PalmFtle()
@@ -398,6 +402,7 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     pf.time_index = time_index
     pf.frozen = frozen
     pf.checksum = checksum
+    pf.zero_fill = zero_fill
     pf.verbose = verbose
 
     #res = pf.compute_ftle()
@@ -490,6 +495,15 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Suppress diagnostics (default).")
     p.set_defaults(verbose=False)
 
+    g_zf = p.add_mutually_exclusive_group()
+    g_zf.add_argument("--zero-fill", dest="zero_fill", action="store_true",
+                      help="Replace masked fill values (e.g. -9999 building cells) "
+                           "with zero (default, physically correct).")
+    g_zf.add_argument("--no-zero-fill", dest="zero_fill", action="store_false",
+                      help="Preserve fill values as-is. Reproduces pre-fix behaviour; "
+                           "produces artefacts at building boundaries.")
+    p.set_defaults(zero_fill=True)
+
     return p
 
 
@@ -508,6 +522,7 @@ def cli():
         time_index=args.time_index,
         frozen=args.frozen,
         checksum=args.checksum,
+        zero_fill=args.zero_fill,
         verbose=args.verbose,
     )
 

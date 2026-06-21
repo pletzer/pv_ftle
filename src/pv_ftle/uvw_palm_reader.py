@@ -27,8 +27,20 @@ class UVWPalmReader(UVWBaseReader):
     replaced with zero on load.
     """
 
-    def __init__(self, filename: str, tmin: float, tmax: float):
+    def __init__(self, filename: str, tmin: float, tmax: float,
+                 zero_fill: bool = True):
+        """
+        Parameters
+        ----------
+        zero_fill : bool
+            If True (default), replace masked fill values (e.g. -9999 building
+            cells) with zero.  This is physically correct: buildings have zero
+            velocity, and leaving -9999 in place corrupts any cell-centre
+            interpolation by mixing real velocities with the fill value.
+            Set False only to reproduce pre-fix results.
+        """
         super().__init__(filename, tmin, tmax)
+        self.zero_fill = zero_fill
         # lazily populated on first access
         self._uface: np.ndarray | None = None
         self._vface: np.ndarray | None = None
@@ -90,18 +102,19 @@ class UVWPalmReader(UVWBaseReader):
         return slice(i_start, i_end + 1)
 
     @staticmethod
-    def _to_float32(arr) -> np.ndarray:
+    def _to_float32(arr, zero_fill: bool = False) -> np.ndarray:
         """Convert a (possibly masked) NetCDF array to a plain float32 ndarray.
 
-        Only genuine NaN values are replaced with zero.  Fill values such as
-        -9999 (used by PALM for building / obstacle cells) are intentionally
-        preserved: the C++ integrator expects them as out-of-domain markers and
-        trajectories should not enter those cells.
-
-        Applying nan_to_num to a masked array first keeps the mask intact and
-        only patches NaN in the underlying data; np.array then materialises the
-        masked slots at their stored fill value (e.g. -9999).
+        Parameters
+        ----------
+        zero_fill : bool
+            False (default): only genuine NaN values are replaced with zero;
+            masked fill values (e.g. -9999) are preserved in the output array.
+            True: masked slots are filled with zero before conversion, which is
+            physically correct for building cells but changes downstream results.
         """
+        if zero_fill and hasattr(arr, 'filled'):
+            arr = arr.filled(0.0)
         return np.array(np.nan_to_num(arr, nan=0.0), dtype=np.float32)
 
     def _load(self) -> None:
@@ -122,9 +135,9 @@ class UVWPalmReader(UVWBaseReader):
             # Velocity face fluxes – only the selected time window.
             # Use .filled(0.0) before converting so that masked fill values
             # (e.g. 9.96921e+36) are replaced with zero, not just NaNs.
-            self._uface = self._to_float32(nc.variables[fld['u']][sl])
-            self._vface = self._to_float32(nc.variables[fld['v']][sl])
-            self._wface = self._to_float32(nc.variables[fld['w']][sl])
+            self._uface = self._to_float32(nc.variables[fld['u']][sl], self.zero_fill)
+            self._vface = self._to_float32(nc.variables[fld['v']][sl], self.zero_fill)
+            self._wface = self._to_float32(nc.variables[fld['w']][sl], self.zero_fill)
 
     def _ensure_loaded(self) -> None:
         if self._taxis is None:

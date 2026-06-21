@@ -51,6 +51,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Arrow length scale in metres (default: auto = one grid cell "
              "per stride width).",
     )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument(
+        "--zero-fill", dest="zero_fill", action="store_true", default=True,
+        help="Replace masked fill values (e.g. -9999 building cells) with "
+             "zero (default, physically correct).",
+    )
+    g.add_argument(
+        "--no-zero-fill", dest="zero_fill", action="store_false",
+        help="Preserve fill values as-is.  Reproduces pre-fix behaviour; "
+             "produces artefacts at building boundaries.",
+    )
     return p
 
 
@@ -76,8 +87,13 @@ def main():
         f"(t = {t_val:.1f} s)  from {args.palmfile}"
     )
 
+    if not args.zero_fill:
+        print("WARNING: --no-zero-fill active; fill values (-9999) are preserved "
+              "and will corrupt interpolation near building boundaries.")
+
     # load exactly one time step
-    reader = UVWPalmReader(args.palmfile, tmin=t_val, tmax=t_val)
+    reader = UVWPalmReader(args.palmfile, tmin=t_val, tmax=t_val,
+                           zero_fill=args.zero_fill)
 
     reader.plotUV(
         time_index=0,

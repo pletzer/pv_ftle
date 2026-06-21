@@ -211,6 +211,7 @@ class UVWBaseReader(ABC):
                 f'   [z] up   [Z] down',
                 name='level_label', position='upper_left', font_size=12,
             )
+            pl.camera_position = 'xy'
             pl.render()
 
         def go_up() -> None:
