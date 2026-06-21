@@ -96,7 +96,7 @@ def compute_ftle(F, tintegr):
     """
     C = np.einsum('...ki,...kj->...ij', F, F)    # C = F^T F
     lam = np.linalg.eigvalsh(C.reshape(-1, 3, 3))[:, -1]
-    lam = np.maximum(lam, 1e-16).reshape(F.shape[:3])
+    lam = np.maximum(lam, 1.0).reshape(F.shape[:3])   # incompressible: σ_max ≥ 1 ⟹ λ_max ≥ 1, FTLE ≥ 0
     if abs(tintegr) > 1e-12:
         return np.log(lam) / (2.0 * abs(tintegr))
     return np.zeros_like(lam)

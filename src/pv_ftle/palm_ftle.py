@@ -13,6 +13,7 @@ sys.path.insert(0, plugin_dir)
 
 # C++ extensions
 from pv_ftle import _ftlecpp as ftlecpp
+from pv_ftle.uvw_palm_reader import UVWPalmReader
 
 try:
     # paraview 6.x
@@ -24,21 +25,33 @@ except:
 # -------------------------
 # RK4 step estimate (CFL-like)
 # -------------------------
-def estimate_nsteps(uface: np.ndarray, vface: np.ndarray, wface: np.ndarray, 
-                    dx: float, dy: float, dz: np.ndarray, cfl: float, T: float, 
-                    min_steps: int=20):
+def estimate_nsteps(uface: np.ndarray, vface: np.ndarray, wface: np.ndarray,
+                    dx: float, dy: float, dz: np.ndarray, cfl: float, T: float,
+                    min_steps: int=20, fill_threshold: float=1e3):
     """
     Estimate number of RK4 steps using a CFL-like heuristic:
     nsteps ~ (Umax * |T| / hmin) / cfl
     with lower bound min_steps.
+
+    fill_threshold: velocity magnitude (m/s) above which a cell is considered
+    a fill / obstacle cell (e.g. PALM uses -9999) and is excluded from the
+    Umax estimate.  Defaults to 1000 m/s, well above any physical wind speed.
     """
     # number of cells
     nz, ny, nx = uface.shape[-3], uface.shape[-2], vface.shape[-1]
 
-    speedSquare = uface[:, :nz, :ny, :nx] * uface[:, :nz, :ny, :nx] + \
-                  vface[:, :nz, :ny, :nx] * vface[:, :nz, :ny, :nx] + \
-                  wface[:, :nz, :ny, :nx] * wface[:, :nz, :ny, :nx]
-    Umax = np.sqrt(np.nanmax(speedSquare))
+    u = uface[:, :nz, :ny, :nx]
+    v = vface[:, :nz, :ny, :nx]
+    w = wface[:, :nz, :ny, :nx]
+
+    speedSquare = u*u + v*v + w*w
+
+    # Exclude fill-value cells: their speed² is O(fill_value²) >> threshold²
+    physical = speedSquare <= fill_threshold ** 2
+    if physical.any():
+        Umax = np.sqrt(float(speedSquare[physical].max()))
+    else:
+        Umax = 0.0
 
     hmin = min(dx, dy, dz)
     crossings = Umax * abs(T) / hmin
@@ -139,7 +152,7 @@ class PalmFtle:
         # --------------------------------------------------------------
         res = dict()
         for name, var in nc.variables.items():
-            # velocity field names are inferred, they shuld start with u, v and w
+            # velocity field names are inferred, they should start with u, v and w
             if re.match(r'^[Uu]', name) and (getattr(var, 'units', '') == 'm/s' or getattr(var, 'units', '') == 'm s-1'):
                 # u velocity detected
                 res['u'] = name
@@ -180,191 +193,180 @@ NetCDF variable names:
     def compute_ftle(self) -> dict:
 
         # --------------------------------------------------------------
-        # Read NetCDF data
+        # Minimal read: time axis only, to resolve the index-based window
         # --------------------------------------------------------------
         with netCDF4.Dataset(self.palmfile, "r") as nc:
-
-            tm0 = time.perf_counter()
-
             fld = self.get_nc_names(nc)
+            t_all = np.asarray(nc.variables[fld['time']][:], dtype=np.float64)
 
-            if self.verbose:
-                print(f'self.imin={self.imin} self.imax={self.imax} self.jmin={self.jmin} self.jmax={self.jmax}')
+        dt = float(t_all[1] - t_all[0])   # assume constant time step
+        nt_all = t_all.size
+        tmin_idx, tmax_idx = self.select_time_window(dt, nt_all)  # index-based
 
-            # Note:
-            # imin:imax and jmin:jmax define ONLY the seeding and FTLE output region.
-            # The velocity field is interpolated over the full PALM domain to allow
-            # trajectories to leave the seed region.
- 
-            # axes for the seeded region
-            xaxis = nc.variables[ fld['x'] ][self.imin:self.imax+1]
-            yaxis = nc.variables[ fld['y'] ][self.jmin:self.jmax+1]
-            zaxis = nc.variables[ fld['z'] ][:] # read all the elevations
-            # full domain axes
-            xaxis_full = nc.variables[ fld['x'] ][:]
-            yaxis_full = nc.variables[ fld['y'] ][:]
-            dt = nc.variables[ fld['time'] ][1] - nc.variables[ fld['time'] ][0] # assume constant time step
-            nt_all = nc.variables[ fld['time'] ].size
+        nt = tmax_idx - tmin_idx
+        if not self.frozen and nt < 2:
+            raise ValueError(
+                f"Need at least two time levels for time-dependent FTLE. "
+                f"Selected time index: {self.time_index}. Integration time: {self.tintegr}."
+            )
 
-            tmin, tmax = self.select_time_window(dt, nt_all) # tmin and tmax are indices
-            t_axis = nc.variables[  fld['time'] ][tmin:tmax]
-            nt = t_axis.shape[0]
-            if not self.frozen and nt < 2:
-                raise ValueError(f"Need at least two time levels for time-dependent FTLE. Selected time index: {self.time_index}. Integration time: {self.tintegr}.")
+        # --------------------------------------------------------------
+        # Load velocity data and axes via UVWPalmReader
+        # imin:imax / jmin:jmax define ONLY the seeding / FTLE output region;
+        # the reader always loads the full domain so trajectories can leave it.
+        # --------------------------------------------------------------
+        tm0 = time.perf_counter()
 
-            if self.imin < 0 or self.imax >= xaxis_full.size:
-                raise ValueError("Invalid IRange")
-            if self.jmin < 0 or self.jmax >= yaxis_full.size:
-                raise ValueError("Invalid JRange")
+        reader = UVWPalmReader(
+            self.palmfile,
+            tmin=float(t_all[tmin_idx]),
+            tmax=float(t_all[tmax_idx - 1]),
+        )
+        xaxis_full, yaxis_full, zaxis = reader.getAxes()
+        t_axis = reader.getTimeAxis()
+        uface, vface, wface = reader.getFaceFluxes()
 
-            # assume uniform grid in x, y
-            dx = xaxis[1] - xaxis[0]
-            dy = yaxis[1] - yaxis[0]
+        tm1 = time.perf_counter()
 
-            dz = np.diff(zaxis) # not uniform
-            nx1 = len(xaxis)
-            ny1 = len(yaxis)
-            nz1 = len(zaxis)
-            nx1_full = len(xaxis_full)
-            ny1_full = len(yaxis_full)
-            # number of cells
-            nx, ny, nz = nx1 - 1, ny1 - 1, nz1 - 1
-            if self.verbose:
-                print(f'Original grid size: {nz1}x{ny1}x{nx1} nodes ({nz}x{ny}x{nx} cells)')
+        # --------------------------------------------------------------
+        # Validate seed-region bounds and build sub-axes
+        # --------------------------------------------------------------
+        if self.verbose:
+            print(f'self.imin={self.imin} self.imax={self.imax} self.jmin={self.jmin} self.jmax={self.jmax}')
 
-            # mesh with indexing 'ij' so shapes are (nz, ny, nx)
-            zz, yy, xx = np.meshgrid(zaxis, yaxis, xaxis, indexing="ij")
-            xflat = xx.ravel()
-            yflat = yy.ravel()
-            zflat = zz.ravel()
+        if self.imin < 0 or self.imax >= xaxis_full.size:
+            raise ValueError("Invalid IRange")
+        if self.jmin < 0 or self.jmax >= yaxis_full.size:
+            raise ValueError("Invalid JRange")
 
-            # read the velocity, expect shape (time, nz, ny, nx). Note we're reading in one more cell in y and
-            # x, and all the cells in z. We're also replacing all the nans with zeros. We read all the 
-            # velocities to allow trajectories to leave the seed domain
-            uface = np.nan_to_num( 
-                nc.variables[ fld['u'] ][tmin:tmax, :, :, :],
-                copy=True, nan=0.0)
-            vface = np.nan_to_num( 
-                nc.variables[ fld['v'] ][tmin:tmax, :, :, :],
-                copy=True, nan=0.0)
-            wface = np.nan_to_num( 
-                nc.variables[ fld['w'] ][tmin:tmax, :, :, :],
-                copy=True, nan=0.0)
+        xaxis = xaxis_full[self.imin:self.imax + 1]
+        yaxis = yaxis_full[self.jmin:self.jmax + 1]
 
-            tm1 = time.perf_counter()
+        dx = float(xaxis[1] - xaxis[0])
+        dy = float(yaxis[1] - yaxis[0])
+        dz = np.diff(zaxis)   # not uniform
 
-            # total number of grid points
-            n = len(xflat)
+        nx1 = len(xaxis)
+        ny1 = len(yaxis)
+        nz1 = len(zaxis)
+        nx1_full = len(xaxis_full)
+        ny1_full = len(yaxis_full)
+        nx, ny, nz = nx1 - 1, ny1 - 1, nz1 - 1
 
-            # integrate the trajectories. xyz0, the initial position, is a concatenated array of 
-            # [x..., y..., z...] positions.
-            # Note: FTLE is computed from corner-seeded trajectories.
-            xyz0 = np.concatenate([xflat, yflat, zflat]).astype(np.float32)
-            nsteps = estimate_nsteps(uface, vface, wface, 
-                                      dx=dx, dy=dy, dz=dz.min(), 
-                                      cfl=self.cfl, T=self.tintegr)
-            if self.verbose:
-                print(f'nsteps = {nsteps}')
+        if self.verbose:
+            print(f'Original grid size: {nz1}x{ny1}x{nx1} nodes ({nz}x{ny}x{nx} cells)')
 
-            tm2 = time.perf_counter()
+        # seed positions at grid corners; shape (nz1, ny1, nx1)
+        zz, yy, xx = np.meshgrid(zaxis, yaxis, xaxis, indexing="ij")
+        n = xx.size
+        xyz0 = np.concatenate([xx.ravel(), yy.ravel(), zz.ravel()]).astype(np.float32)
 
-            # make sure the masked arrays are converted to plain, float32 ndarrays
-            # and make sure the arrays have the C grid staggering size
-            xyz0_clean = np.array(xyz0, dtype=np.float32)
-            uface_clean = np.array(uface[:, :, :-1, :], dtype=np.float32)
-            vface_clean = np.array(vface[:, :, :, :-1], dtype=np.float32)
-            wface_clean = np.array(wface[:, :, :-1, :-1], dtype=np.float32)
-            xaxis_clean = np.array(xaxis_full, dtype=np.float32)
-            yaxis_clean = np.array(yaxis_full, dtype=np.float32)
-            zaxis_clean = np.array(zaxis, dtype=np.float32)
-            t_axis_clean = np.array(t_axis, dtype=np.float32)
+        # --------------------------------------------------------------
+        # Trim staggering halos and prepare float32 arrays for RK4
+        # --------------------------------------------------------------
+        nsteps = estimate_nsteps(uface, vface, wface,
+                                 dx=dx, dy=dy, dz=dz.min(),
+                                 cfl=self.cfl, T=self.tintegr)
+        if self.verbose:
+            print(f'nsteps = {nsteps}')
 
-            if self.verbose:
-                print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
-                print(f'''
+        tm2 = time.perf_counter()
+
+        uface_clean = np.array(uface[:, :, :-1, :],   dtype=np.float32)
+        vface_clean = np.array(vface[:, :, :,   :-1], dtype=np.float32)
+        wface_clean = np.array(wface[:, :, :-1, :-1], dtype=np.float32)
+        xaxis_clean = np.array(xaxis_full, dtype=np.float32)
+        yaxis_clean = np.array(yaxis_full, dtype=np.float32)
+        zaxis_clean = np.array(zaxis,      dtype=np.float32)
+        t_axis_clean = np.array(t_axis,    dtype=np.float32)
+
+        if self.verbose:
+            print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
+            print(f'''
 u: shape={uface_clean.shape} type={uface_clean.dtype}
 v: shape={vface_clean.shape} type={vface_clean.dtype}
 w: shape={wface_clean.shape} type={wface_clean.dtype}''')
 
-            # Runge-Kutta 4
-            time_val = t_axis_clean[0]  # start of selected window
-            dt_step = self.tintegr / nsteps
-            xyz = ftlecpp.integrate_rk4(
-                xyz0_clean,
-                time_val,
-                dt_step,
-                nsteps,
-                uface_clean,
-                vface_clean,
-                wface_clean,
-                xaxis_clean,
-                yaxis_clean,
-                zaxis_clean,
-                dx,
-                dy,
-                nx1_full,
-                ny1_full,
-                nz1,
-                self.frozen,
-                t_axis_clean
-            )
+        # --------------------------------------------------------------
+        # Runge-Kutta 4 trajectory integration
+        # --------------------------------------------------------------
+        time_val = t_axis_clean[0]   # start of selected window
+        dt_step = self.tintegr / nsteps
+        xyz = ftlecpp.integrate_rk4(
+            xyz0,
+            time_val,
+            dt_step,
+            nsteps,
+            uface_clean,
+            vface_clean,
+            wface_clean,
+            xaxis_clean,
+            yaxis_clean,
+            zaxis_clean,
+            dx,
+            dy,
+            nx1_full,
+            ny1_full,
+            nz1,
+            self.frozen,
+            t_axis_clean,
+        )
 
-            tm3 = time.perf_counter()
+        tm3 = time.perf_counter()
 
-            # reshape
-            Xf = xyz[0:n].reshape((nz1, ny1, nx1))
-            Yf = xyz[n:2*n].reshape((nz1, ny1, nx1))
-            Zf = xyz[2*n:3*n].reshape((nz1, ny1, nx1))
+        # reshape final positions
+        Xf = xyz[0:n].reshape((nz1, ny1, nx1))
+        Yf = xyz[n:2*n].reshape((nz1, ny1, nx1))
+        Zf = xyz[2*n:3*n].reshape((nz1, ny1, nx1))
 
-            # Compute the deformation gradient F at cell centres
-            f11, f12, f13 = gradient_corner_to_center(Xf, dx, dy, dz)
-            f21, f22, f23 = gradient_corner_to_center(Yf, dx, dy, dz)
-            f31, f32, f33 = gradient_corner_to_center(Zf, dx, dy, dz)
+        # deformation gradient at cell centres
+        f11, f12, f13 = gradient_corner_to_center(Xf, dx, dy, dz)
+        f21, f22, f23 = gradient_corner_to_center(Yf, dx, dy, dz)
+        f31, f32, f33 = gradient_corner_to_center(Zf, dx, dy, dz)
 
-            # Cauchy-Green tensor components
-            C = np.empty((nz, ny, nx, 3, 3), dtype=float)
-            C[..., 0, 0] = f11*f11 + f21*f21 + f31*f31
-            C[..., 0, 1] = f11*f12 + f21*f22 + f31*f32
-            C[..., 0, 2] = f11*f13 + f21*f23 + f31*f33
-            C[..., 1, 0] = C[..., 0, 1]
-            C[..., 1, 1] = f12*f12 + f22*f22 + f32*f32
-            C[..., 1, 2] = f12*f13 + f22*f23 + f32*f33
-            C[..., 2, 0] = C[..., 0, 2]
-            C[..., 2, 1] = C[..., 1, 2]
-            C[..., 2, 2] = f13*f13 + f23*f23 + f33*f33
-            C_flat = C.reshape(-1, 3, 3)
+        # Cauchy-Green tensor components
+        C = np.empty((nz, ny, nx, 3, 3), dtype=float)
+        C[..., 0, 0] = f11*f11 + f21*f21 + f31*f31
+        C[..., 0, 1] = f11*f12 + f21*f22 + f31*f32
+        C[..., 0, 2] = f11*f13 + f21*f23 + f31*f33
+        C[..., 1, 0] = C[..., 0, 1]
+        C[..., 1, 1] = f12*f12 + f22*f22 + f32*f32
+        C[..., 1, 2] = f12*f13 + f22*f23 + f32*f33
+        C[..., 2, 0] = C[..., 0, 2]
+        C[..., 2, 1] = C[..., 1, 2]
+        C[..., 2, 2] = f13*f13 + f23*f23 + f33*f33
+        C_flat = C.reshape(-1, 3, 3)
 
-            tm4 = time.perf_counter()
+        tm4 = time.perf_counter()
 
-            eigvals = np.linalg.eigvalsh(C_flat)
+        eigvals = np.linalg.eigvalsh(C_flat)
 
-            tm5 = time.perf_counter()
+        tm5 = time.perf_counter()
 
-            # Note: the eigenvalues are cell centred (nz, ny, nx)
-            max_lambda = np.maximum(eigvals[:, -1], 1.e-16).reshape((nz, ny, nx))
+        # eigenvalues are cell-centred (nz, ny, nx)
+        max_lambda = np.maximum(eigvals[:, -1], 1.e-16).reshape((nz, ny, nx))
 
-            if abs(self.tintegr) > 1.e-12:
-                ftle = np.log(max_lambda) / (2.0 * abs(float(self.tintegr)))
-            else:
-                # zero integration time
-                ftle = np.zeros_like(max_lambda)
+        if abs(self.tintegr) > 1.e-12:
+            ftle = np.log(max_lambda) / (2.0 * abs(float(self.tintegr)))
+        else:
+            ftle = np.zeros_like(max_lambda)
 
-            if self.checksum and self.verbose:
-                print(f'Checksum: {np.fabs(ftle).sum()}')
+        if self.checksum and self.verbose:
+            print(f'Checksum: {np.fabs(ftle).sum()}')
 
-            if self.verbose:
-                print(f"""
+        if self.verbose:
+            print(f"""
 time to read:     {tm1 - tm0:.3f} sec
 time for setup:   {tm2 - tm1:.3f} sec
 time RK4:         {tm3 - tm2:.3f} sec
 time deformation: {tm4 - tm3:.3f} sec
 time eigenvalue:  {tm5 - tm4:.3f} sec
-                  """)
+            """)
 
-            return dict(
-                x=xaxis, y=yaxis, z=zaxis, # axes
-                ftle=ftle,
-            )
+        return dict(
+            x=xaxis, y=yaxis, z=zaxis,
+            ftle=ftle,
+        )
 
 def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cfl:float=0.25, 
          imin: int=1, imax: int=-2, jmin: int=1, jmax: int=-2, 

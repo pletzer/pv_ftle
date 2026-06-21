@@ -10,14 +10,16 @@ barycentric coords within that cell.
 
 Cell finding is O(1):  i = floor(p),  ξ = p - i.
 
-For a PALM rectilinear grid with uniform Δx, Δy and variable Δz[k]:
+For a PALM rectilinear Arakawa C-grid with uniform Δx, Δy and variable Δz[k]:
 
     dp/dt = lerp(U[k,j,i], U[k,j,i+1], ξ) / Δx        [cells s⁻¹]
     dq/dt = lerp(V[k,j,i], V[k,j+1,i], η) / Δy
-    dr/dt = lerp(W[k,j,i], W[k+1,j,i], ζ) / Δz[k]
+    dr/dt = W_interp(z_phys) / Δz[k]
 
-where U, V, W are the node-centred velocity components (same spatial grid as
-the coordinate axes), which is how palm_ftle.py treats them.
+where U (zu_xy, y, xu) and V (zu_xy, yv, x) are taken at their cell-centre z
+level (kn), and W (zw_xy, y, x) is interpolated at the particle's physical z
+using the native zw_xy face-position array (mimetic, no regridding).  This
+preserves the Arakawa C-grid staggering exactly.
 
 After integration the reference positions are converted back to physical
 (Cartesian) coordinates via the rectilinear map and FTLE is computed using
@@ -55,25 +57,26 @@ from ftle_common import (
 # ── PALM-specific Numba kernels ───────────────────────────────────────────────
 
 @njit(parallel=True, cache=True)
-def _palm_ref_velocity_nb(pos_ref, U, V, W_face,
-                          dx, dy, z_corners,
-                          nz, ny, nx):
+def _palm_ref_velocity_nb(pos_ref, U, V, W,
+                          dx, dy, z_corners, zw,
+                          nz, ny, nx, nz_w):
     """
-    Reference-space velocity for a PALM rectilinear grid.
+    Reference-space velocity for a PALM Arakawa C-grid.
 
-    pos_ref    : (N, 3)    continuous index positions (p, q, r)
-    U          : (nz, ny, nx)    face-centred u (on xu grid)  [m/s]
-    V          : (nz, ny, nx)    face-centred v (on yv grid)  [m/s]
-    W_face     : (nz+1, ny, nx)  face-centred w; W_face[0]=0 (ground),
-                                 W_face[nz]=0 (top).  Building-fluid
-                                 interfaces are pre-zeroed in compute().
-    dx, dy     : scalar cell widths [m]
-    z_corners  : (nz+1,) z-corner positions [m]
+    Each component is taken at its natural staggered location (mimetic):
+      u (nz, ny, nx)   : cell-centre z (z_corners), x-face
+      v (nz, ny, nx)   : cell-centre z (z_corners), y-face
+      w (nz_w, ny, nx) : z-face (zw[]), cell-centre x,y
+
+    pos_ref   : (N, 3)      continuous index positions (p, q, r) in z_corners frame
+    z_corners : (nz+1,)     z positions of u/v levels and seed nodes [m]
+    zw        : (nz_w,)     z positions of w faces [m]
+    nz_w      : int         number of w levels
 
     Returns vel_ref : (N, 3)  [cells/s]
 
     Lateral BC: domain edges clamp to nearest interior face (Neumann).
-    Vertical BC: ground and top faces are enforced to zero in W_face.
+    w BC: constant extrapolation beyond the first/last zw level.
     """
     N = len(pos_ref)
     vel = np.zeros((N, 3))
@@ -94,16 +97,26 @@ def _palm_ref_velocity_nb(pos_ref, U, V, W_face,
         if dz_k <= 0.0:
             continue
 
-        # Lateral: clamp at domain boundary (Neumann); zero-velocity building
-        # cells are already stored as 0 in U/V so no special treatment needed.
         ip1 = min(in_ + 1, nx - 1)
         jp1 = min(jn  + 1, ny - 1)
-        # Vertical: kn+1 is always ≤ nz because kn ≤ nz-1; W_face has nz+1 levels.
-        kp1 = kn + 1
 
-        vel[n, 0] = ((1.0 - xi)   * U[kn, jn, in_] + xi   * U[kn, jn, ip1]) / dx
-        vel[n, 1] = ((1.0 - eta)  * V[kn, jn, in_] + eta  * V[kn, jp1, in_]) / dy
-        vel[n, 2] = ((1.0 - zeta) * W_face[kn, jn, in_] + zeta * W_face[kp1, jn, in_]) / dz_k
+        # u and v: at their cell-centre z level (index kn)
+        vel[n, 0] = ((1.0 - xi)  * U[kn, jn, in_] + xi  * U[kn, jn, ip1]) / dx
+        vel[n, 1] = ((1.0 - eta) * V[kn, jn, in_] + eta * V[kn, jp1, in_]) / dy
+
+        # w: at z-face positions zw[] — interpolate in physical z
+        z_phys = z_corners[kn] + zeta * dz_k
+        kw = 0
+        while kw < nz_w - 2 and zw[kw + 1] <= z_phys:
+            kw += 1
+        dz_w = zw[kw + 1] - zw[kw]
+        if dz_w > 0.0:
+            alpha_w = (z_phys - zw[kw]) / dz_w
+            alpha_w = min(max(alpha_w, 0.0), 1.0)
+        else:
+            alpha_w = 0.0
+        kw1 = min(kw + 1, nz_w - 1)
+        vel[n, 2] = ((1.0 - alpha_w) * W[kw, jn, in_] + alpha_w * W[kw1, jn, in_]) / dz_k
 
     return vel
 
@@ -251,12 +264,19 @@ class PalmFtleIdx(FtleBase):
             raise ValueError(f'Expected 4D u field (t,z,y,x), got {dims}')
 
         res['time'] = dims[-4]
-        res['z']    = dims[-3]
+        res['z']    = dims[-3]   # z axis for u/v (and seeds)
         res['y']    = dims[-2]
         res['x']    = dims[-1]
 
+        # w may live on a different vertical axis (zw vs zu in PALM C-grid).
+        # Read its z dimension separately so we can handle the stagger.
+        w_dims = nc.variables[res['w']].dimensions
+        res['zw'] = w_dims[-3]   # may equal res['z'] if cross-section already interpolated
+
         if verbose:
             print('NetCDF field names:', res)
+            if res['zw'] != res['z']:
+                print(f"  NOTE: w uses z-axis '{res['zw']}' (differs from u/v '{res['z']}')")
         return res
 
     # ── compute ───────────────────────────────────────────────────────────────
@@ -273,6 +293,10 @@ class PalmFtleIdx(FtleBase):
             x_nodes = np.array(nc.variables[fld['x']][:], dtype=np.float64)
             y_nodes = np.array(nc.variables[fld['y']][:], dtype=np.float64)
             z_raw   = np.array(nc.variables[fld['z']][:], dtype=np.float64)
+            # Read w's own z axis (may be zw ≠ zu)
+            zw_raw  = np.array(nc.variables[fld['zw']][:], dtype=np.float64)
+            if self.verbose and fld['zw'] != fld['z']:
+                print(f"  z (u/v): {z_raw[:4]} …  z (w): {zw_raw[:4]} …")
 
             nx = len(x_nodes) - 1   # cells = corners - 1
             ny = len(y_nodes) - 1
@@ -282,14 +306,28 @@ class PalmFtleIdx(FtleBase):
                 print(f'PALM grid: {nz}×{ny}×{nx} cells')
 
             # ── z-corners ────────────────────────────────────────────────────
-            # If z_raw has nz+1 values treat them as corners; if nz, derive corners.
+            # Two conventions in PALM cross-section output:
+            #
+            # Case A (z_raw has nz+1 values): z_raw IS the node/face positions
+            #   (e.g. zu_xy). Seeds are placed at these heights directly — the
+            #   first seed is at zu_xy[0] > 0, matching palm_ftle.py exactly.
+            #   W[k] is also at zu_xy[k], so no averaging is needed; we keep all
+            #   nz+1 levels.  This is the common case for PALM cross-sections.
+            #
+            # Case B (z_raw has nz values): z_raw are cell-centre heights.
+            #   Derive corners via build_palm_corner_z; z_corners[0] = 0 (ground).
+            #   W is cell-centred and must be converted to face-centred.
             nz_raw = len(z_raw)
             if nz_raw == nz + 1:
-                z_corners = z_raw
+                z_corners = z_raw        # Case A: node positions already
+                z_case = 'A'
             else:
-                # nz_raw == nz: treat as cell-centre heights → derive corners
-                nz = nz_raw
+                nz = nz_raw              # Case B: nz was one too small
                 z_corners = build_palm_corner_z(z_raw)
+                z_case = 'B'
+            if self.verbose:
+                print(f'z convention: case {z_case}  z_corners[0]={z_corners[0]:.2f} m  '
+                      f'z_corners[-1]={z_corners[-1]:.2f} m  nz={nz}')
 
             # ── read velocities (single time snapshot) ────────────────────
             # Two-stage fill-value removal:
@@ -328,33 +366,38 @@ class PalmFtleIdx(FtleBase):
 
         t1 = time.perf_counter()
 
-        # Normalise shapes to (nz, ny, nx)
-        U, V, W = _normalize_velocity(U_raw, V_raw, W_raw, nz, ny, nx)
+        # Normalise U, V to (nz, ny, nx)
+        U, V, _ = _normalize_velocity(U_raw, V_raw, W_raw, nz, ny, nx)
         U = np.nan_to_num(U, nan=0.0)
         V = np.nan_to_num(V, nan=0.0)
-        W = np.nan_to_num(W, nan=0.0)
 
-        # Crop building mask to (nz, ny, nx) to match W
-        W_bld_c = np.ascontiguousarray(
-            W_bld[:nz, :ny, :nx] if W_bld.shape[0] >= nz else
-            np.pad(W_bld, ((0, nz - W_bld.shape[0]), (0, 0), (0, 0)),
-                   constant_values=True)
-        )
-
-        # Build face-centred W  (nz+1, ny, nx) with correct BCs.
+        # ── W on its native zw grid (Arakawa C-grid, mimetic) ────────────────────
         #
-        # W[k] lives at cell-centre height zu_xy[k].  The face between cells
-        # k-1 and k (at z_corners[k]) gets:
-        #   - 0          at k=0   (ground: no-penetration)
-        #   - 0          if EITHER adjacent cell is a building (masked cell),
-        #                because buildings impose no-flux on their faces
-        #   - 0.5*(W[k-1]+W[k])  for fluid-fluid interfaces
-        #   - 0          at k=nz  (top: no-penetration)
-        W_face = np.zeros((nz + 1, ny, nx), dtype=np.float64)
-        # Interior faces k = 1 … nz-1
-        both_fluid = (~W_bld_c[:-1]) & (~W_bld_c[1:])   # (nz-1, ny, nx) bool
-        W_face[1:-1] = np.where(both_fluid, 0.5 * (W[:-1] + W[1:]), 0.0)
-        # W_face[0] = 0 (ground) and W_face[nz] = 0 (top) are already 0
+        # w lives on z-faces (zw_xy axis); u and v live on z cell-centres (zu_xy).
+        # We keep W at its natural positions — no regridding onto z_corners.
+        # The kernel interpolates W in physical z using the zw[] array directly.
+        #
+        # Case A (z_raw has nz+1 values = z_corners = zu_xy node heights):
+        #   W is on zw_raw (zw_xy axis), which is offset from z_corners by ~dz/2.
+        #
+        # Case B (z_raw has nz cell-centre values):
+        #   W is cell-centred; use z_raw as its z positions.
+        if z_case == 'A':
+            nz_w = min(W_raw.shape[0], len(zw_raw))
+            W = np.ascontiguousarray(W_raw[:nz_w, :ny, :nx], dtype=np.float64)
+            W = np.nan_to_num(W, nan=0.0)
+            zw = np.ascontiguousarray(zw_raw[:nz_w], dtype=np.float64)
+        else:
+            nz_w = min(W_raw.shape[0], len(z_raw))
+            W = np.ascontiguousarray(W_raw[:nz_w, :ny, :nx], dtype=np.float64)
+            W = np.nan_to_num(W, nan=0.0)
+            # Zero building cells (fill values already zeroed by _read_vel)
+            zw = np.ascontiguousarray(z_raw[:nz_w], dtype=np.float64)
+
+        if self.verbose:
+            print(f'  W: {nz_w} levels on zw  '
+                  f'(zw[0]={zw[0]:.2f} m  zw[-1]={zw[-1]:.2f} m  '
+                  f'z_corners[0]={z_corners[0]:.2f} m)')
 
         dx = float(x_nodes[1] - x_nodes[0])
         dy = float(y_nodes[1] - y_nodes[0])
@@ -385,7 +428,7 @@ class PalmFtleIdx(FtleBase):
         # ── CFL step count ────────────────────────────────────────────────────
         max_spd = max(float(np.nanmax(np.abs(U))),
                       float(np.nanmax(np.abs(V))),
-                      float(np.nanmax(np.abs(W_face))))
+                      float(np.nanmax(np.abs(W))))
         dz_cells = np.diff(z_corners)
         h_min = min(dx, dy, float(dz_cells.min()))
         h_min = max(h_min, 1.0)
@@ -394,20 +437,25 @@ class PalmFtleIdx(FtleBase):
         if self.verbose:
             print(f'max_speed={max_spd:.2f} m/s  h_min={h_min:.2f} m  '
                   f'nsteps={nsteps}  dt={dt:.4f} s')
+            if max_spd > 50.0:
+                print(f'  WARNING: max_speed={max_spd:.1f} m/s is suspiciously high '
+                      f'— possible fill values surviving zeroing')
 
         t2 = time.perf_counter()
 
         # ── integrate in reference space ──────────────────────────────────────
         U_nb  = np.ascontiguousarray(U,         dtype=np.float64)
         V_nb  = np.ascontiguousarray(V,         dtype=np.float64)
-        Wf_nb = np.ascontiguousarray(W_face,    dtype=np.float64)
+        W_nb  = np.ascontiguousarray(W,         dtype=np.float64)
         zc    = np.ascontiguousarray(z_corners, dtype=np.float64)
+        zw_nb = np.ascontiguousarray(zw,        dtype=np.float64)
         nz_   = np.int64(nz); ny_ = np.int64(ny); nx_ = np.int64(nx)
+        nz_w_ = np.int64(nz_w)
         dx_   = float(dx);    dy_ = float(dy)
 
         def vel_fn(pos):
-            return _palm_ref_velocity_nb(pos, U_nb, V_nb, Wf_nb,
-                                         dx_, dy_, zc, nz_, ny_, nx_)
+            return _palm_ref_velocity_nb(pos, U_nb, V_nb, W_nb,
+                                         dx_, dy_, zc, zw_nb, nz_, ny_, nx_, nz_w_)
 
         final_ref = integrate_rk4_ref(seeds_ref, dt, nsteps, vel_fn,
                                        verbose=self.verbose)

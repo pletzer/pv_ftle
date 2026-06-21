@@ -89,6 +89,21 @@ class UVWPalmReader(UVWBaseReader):
 
         return slice(i_start, i_end + 1)
 
+    @staticmethod
+    def _to_float32(arr) -> np.ndarray:
+        """Convert a (possibly masked) NetCDF array to a plain float32 ndarray.
+
+        Only genuine NaN values are replaced with zero.  Fill values such as
+        -9999 (used by PALM for building / obstacle cells) are intentionally
+        preserved: the C++ integrator expects them as out-of-domain markers and
+        trajectories should not enter those cells.
+
+        Applying nan_to_num to a masked array first keeps the mask intact and
+        only patches NaN in the underlying data; np.array then materialises the
+        masked slots at their stored fill value (e.g. -9999).
+        """
+        return np.array(np.nan_to_num(arr, nan=0.0), dtype=np.float32)
+
     def _load(self) -> None:
         """Open the file once and read coordinates plus the windowed velocity data."""
         with netCDF4.Dataset(self.filename, 'r') as nc:
@@ -104,10 +119,12 @@ class UVWPalmReader(UVWBaseReader):
             self._yaxis = np.array(nc.variables[fld['y']][:], dtype=np.float64)
             self._zaxis = np.array(nc.variables[fld['z']][:], dtype=np.float64)
 
-            # Velocity face fluxes – only the selected time window; NaNs → 0
-            self._uface = np.nan_to_num(np.array(nc.variables[fld['u']][sl], dtype=np.float32))
-            self._vface = np.nan_to_num(np.array(nc.variables[fld['v']][sl], dtype=np.float32))
-            self._wface = np.nan_to_num(np.array(nc.variables[fld['w']][sl], dtype=np.float32))
+            # Velocity face fluxes – only the selected time window.
+            # Use .filled(0.0) before converting so that masked fill values
+            # (e.g. 9.96921e+36) are replaced with zero, not just NaNs.
+            self._uface = self._to_float32(nc.variables[fld['u']][sl])
+            self._vface = self._to_float32(nc.variables[fld['v']][sl])
+            self._wface = self._to_float32(nc.variables[fld['w']][sl])
 
     def _ensure_loaded(self) -> None:
         if self._taxis is None:
