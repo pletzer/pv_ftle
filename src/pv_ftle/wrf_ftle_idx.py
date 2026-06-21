@@ -45,14 +45,18 @@ from numba import njit, prange
 import argparse
 import time
 
-# ── shared infrastructure from the Cartesian version ─────────────────────────
+# ── shared infrastructure ─────────────────────────────────────────────────────
+from ftle_common import (
+    integrate_rk4_ref,         # generic RK4 (replaces local version below)
+    gradient_curvilinear,
+    compute_ftle,
+    FtleBase,
+)
 from wrf_ftle import (
     build_corner_positions,
     compute_face_fluxes,
-    gradient_curvilinear,
-    compute_ftle,
-    WrfFtle,                  # reuse needs_rotation()
-    _trilinear_map_nb,        # Numba helpers
+    WrfFtle,                   # for needs_rotation()
+    _trilinear_map_nb,         # Numba helpers shared with PALM
     _trilinear_derivs_nb,
     _get_corners_nb,
 )
@@ -150,29 +154,12 @@ def _ref_to_cart_nb(pos_ref, r_corners, nz, ny, nx):
     return cart
 
 
-# ── reference-space RK4 integrator ────────────────────────────────────────────
+# ── WRF-specific RK4 wrapper ──────────────────────────────────────────────────
+# integrate_rk4_ref from ftle_common is generic (takes vel_fn).
+# This helper builds the WRF closure and delegates.
 
-def integrate_rk4_ref(seeds_ref, dt, nsteps, fluxes, r_corners, shape,
-                      verbose=False):
-    """
-    Integrate particle trajectories in reference (index) space with RK4.
-
-    seeds_ref : (N, 3)  initial continuous index positions (p, q, r)
-    dt        : float   time step [s], signed
-    nsteps    : int
-    fluxes    : dict of face-flux arrays (from compute_face_fluxes)
-    r_corners : (nz+1, ny+1, nx+1, 3) corner Cartesian positions [m]
-
-    Returns (N, 3) final reference positions.
-
-    No KD-tree and no Newton iteration are needed: the current cell of each
-    particle is always floor(p), floor(q), floor(r) — O(1) — and the reference
-    velocity is computed directly from the face fluxes and Jacobian.
-    """
+def _wrf_integrate(seeds_ref, dt, nsteps, fluxes, r_corners, shape, verbose=False):
     nz, ny, nx = shape
-    pos = seeds_ref.copy()
-
-    # Unpack flux arrays once so the Numba kernel receives plain ndarrays
     fxm = np.ascontiguousarray(fluxes['xi_m'], dtype=np.float64)
     fxp = np.ascontiguousarray(fluxes['xi_p'], dtype=np.float64)
     fem = np.ascontiguousarray(fluxes['et_m'], dtype=np.float64)
@@ -182,30 +169,16 @@ def integrate_rk4_ref(seeds_ref, dt, nsteps, fluxes, r_corners, shape,
     rc  = np.ascontiguousarray(r_corners,       dtype=np.float64)
     nz_ = np.int64(nz); ny_ = np.int64(ny); nx_ = np.int64(nx)
 
-    def _vel(p):
-        return _ref_velocity_nb(p, fxm, fxp, fem, fep, fzm, fzp, rc,
-                                 nz_, ny_, nx_)
+    def vel_fn(pos):
+        return _ref_velocity_nb(pos, fxm, fxp, fem, fep, fzm, fzp, rc,
+                                nz_, ny_, nx_)
 
-    for step in range(nsteps):
-        if verbose and step % max(1, nsteps // 10) == 0:
-            print(f'  RK4 step {step}/{nsteps}')
-
-        v1 = _vel(pos)
-        v2 = _vel(pos + 0.5*dt*v1)
-        v3 = _vel(pos + 0.5*dt*v2)
-        v4 = _vel(pos +     dt*v3)
-
-        pos_new = pos + (dt / 6.0) * (v1 + 2*v2 + 2*v3 + v4)
-        bad = ~np.isfinite(pos_new).all(axis=-1)
-        pos_new[bad] = pos[bad]          # freeze non-finite particles
-        pos = pos_new
-
-    return pos
+    return integrate_rk4_ref(seeds_ref, dt, nsteps, vel_fn, verbose=verbose)
 
 
 # ── main class ────────────────────────────────────────────────────────────────
 
-class WrfFtleIdx:
+class WrfFtleIdx(FtleBase):
     """
     FTLE computation using reference-space (index-space) integration.
     Same interface as WrfFtle; results should be numerically close.
@@ -214,18 +187,10 @@ class WrfFtleIdx:
     _EARTH_RELATIVE_PROJECTIONS = {3, 6}
 
     def __init__(self):
+        super().__init__()            # tintegr, cfl, time_index, imin/imax/jmin/jmax,
+                                      # checksum, cmax, verbose from FtleBase
         self.wrffile      = ""
-        self.tintegr      = -3600.0
-        self.cfl          = 0.25
-        self.time_index   = 0
-        self.rotate_winds = None
-        self.imin         = None
-        self.imax         = None
-        self.jmin         = None
-        self.jmax         = None
-        self.checksum     = False
-        self.cmax         = None
-        self.verbose      = False
+        self.rotate_winds = None      # None = auto-detect from MAP_PROJ
 
     @staticmethod
     def needs_rotation(ds):
@@ -253,9 +218,11 @@ class WrfFtleIdx:
         heights_w = (ph + phb) / 9.81
 
         # ── winds ─────────────────────────────────────────────────────────
-        U = ds['U'][ti].values.astype(np.float64)
-        V = ds['V'][ti].values.astype(np.float64)
-        W = ds['W'][ti].values.astype(np.float64)
+        # xarray converts _FillValue/missing_value to NaN; zero them out so
+        # degenerate cells don't corrupt face-flux computation downstream.
+        U = np.nan_to_num(ds['U'][ti].values.astype(np.float64), nan=0.0)
+        V = np.nan_to_num(ds['V'][ti].values.astype(np.float64), nan=0.0)
+        W = np.nan_to_num(ds['W'][ti].values.astype(np.float64), nan=0.0)
 
         if rotate:
             ca = ds['COSALPHA'][ti].values
@@ -290,19 +257,8 @@ class WrfFtleIdx:
         t2 = time.perf_counter()
 
         # ── seed sub-region ───────────────────────────────────────────────
-        imin = self.imin if self.imin is not None else 0
-        imax = self.imax if self.imax is not None else nx - 1
-        jmin = self.jmin if self.jmin is not None else 0
-        jmax = self.jmax if self.jmax is not None else ny - 1
-        # Support Python-style negative indices (e.g. --imax=-100 → nx-100)
-        if imin < 0: imin = nx + imin
-        if imax < 0: imax = nx + imax
-        if jmin < 0: jmin = ny + jmin
-        if jmax < 0: jmax = ny + jmax
-        imin = max(0, min(imin, nx - 1))
-        imax = max(0, min(imax, nx - 1))
-        jmin = max(0, min(jmin, ny - 1))
-        jmax = max(0, min(jmax, ny - 1))
+        imin, imax, jmin, jmax = FtleBase._resolve_indices(
+            self.imin, self.imax, self.jmin, self.jmax, nx, ny)
 
         # Seed corners in reference space: corner (kp, jp, ip) → (p=ip, q=jp, r=kp)
         ip = np.arange(imin,  imax + 2, dtype=np.float64)   # nxp1_seed = imax-imin+2
@@ -342,8 +298,8 @@ class WrfFtleIdx:
         t3 = time.perf_counter()
 
         # ── integrate in reference space ──────────────────────────────────
-        final_ref = integrate_rk4_ref(seeds_ref, dt, nsteps, fluxes,
-                                       r_corners, shape, verbose=self.verbose)
+        final_ref = _wrf_integrate(seeds_ref, dt, nsteps, fluxes,
+                                    r_corners, shape, verbose=self.verbose)
 
         t4 = time.perf_counter()
 
@@ -368,72 +324,18 @@ class WrfFtleIdx:
             print(f'Read {t1-t0:.2f}s  Build {t2-t1:.2f}s  '
                   f'Setup {t3-t2:.2f}s  RK4 {t4-t3:.2f}s  FTLE {t5-t4:.2f}s')
 
+        result = dict(r_corners=rc_seed, ftle=ftle)
+
         if self.checksum:
-            import hashlib
-            def _cksum(arr, name):
-                b   = np.ascontiguousarray(arr, dtype=np.float64).tobytes()
-                md5 = hashlib.md5(b).hexdigest()
-                fin = arr[np.isfinite(arr)]
-                print(f'  {name:20s}  shape={arr.shape}  '
-                      f'min={fin.min():.6g}  max={fin.max():.6g}  '
-                      f'mean={fin.mean():.6g}  md5={md5}')
-            print('── checksum ──────────────────────────────────────────────')
-            _cksum(rc_seed, 'r_corners')
-            _cksum(ftle,    'ftle')
-            print('──────────────────────────────────────────────────────────')
+            self._print_checksum(result)
 
-        return dict(r_corners=rc_seed, ftle=ftle)
+        return result
 
+    # visualise() and _print_checksum() inherited from FtleBase.
+    # Override title_prefix for the WRF label:
     def visualise(self, result, level=0, cmax=None):
-        """
-        Interactive level viewer.
-
-        Press 'z' / 'Z' to step down / up through vertical levels.
-
-        level : int    starting k-index (0 = bottom; negative counts from top)
-        cmax  : float  colour scale maximum (min fixed at 0); None = data-driven
-        """
-        import pyvista as pv
-        rc   = result['r_corners']
-        ftle = result['ftle']
-        nzp1, nyp1, nxp1 = rc.shape[:3]
-        nz = nzp1 - 1
-
-        clim = [0.0, float(cmax)] if cmax is not None else None
-
-        def make_grid(k):
-            g = pv.StructuredGrid()
-            g.dimensions = (nxp1, nyp1, 1)
-            g.points = np.ascontiguousarray(rc[k].reshape(-1, 3))
-            g.cell_data['FTLE (s⁻¹)'] = ftle[k].ravel(order='C')
-            return g
-
-        state = {'k': int(level) % nz}
-
-        pl = pv.Plotter()
-
-        def refresh():
-            k = state['k']
-            pl.add_mesh(make_grid(k), name='ftle_surface', scalars='FTLE (s⁻¹)',
-                        cmap='hot_r', clim=clim,
-                        scalar_bar_args={'title': 'FTLE (s⁻¹)'})
-            pl.add_text(f'WRF FTLE (idx) – level {k} of {nz}  [z/Z = down/up]',
-                        font_size=12, name='level_text')
-            pl.render()
-
-        def step_down():
-            state['k'] = (state['k'] - 1) % nz
-            refresh()
-
-        def step_up():
-            state['k'] = (state['k'] + 1) % nz
-            refresh()
-
-        pl.add_key_event('z', step_down)
-        pl.add_key_event('Z', step_up)
-        refresh()
-        pl.view_xy()
-        pl.show()
+        super().visualise(result, level=level, cmax=cmax,
+                          title_prefix='WRF FTLE (idx)')
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -478,27 +380,17 @@ def build_parser():
     p = argparse.ArgumentParser(
         description='WRF FTLE – reference-space (index) integration.')
     p.add_argument('wrffile')
-    p.add_argument('--vtkout',         default='wrf_ftle_idx.vts')
-    p.add_argument('--tintegr',        type=float, default=-3600.0)
-    p.add_argument('--cfl',            type=float, default=0.25)
-    p.add_argument('--time-index',     type=int,   default=0)
+    # WRF-specific flag
     grp = p.add_mutually_exclusive_group()
     grp.add_argument('--rotate-winds',    dest='rotate_winds',
                      action='store_true',  default=None)
     grp.add_argument('--no-rotate-winds', dest='rotate_winds',
                      action='store_false')
     p.set_defaults(rotate_winds=None)
-    p.add_argument('--imin',           type=int, default=None)
-    p.add_argument('--imax',           type=int, default=None)
-    p.add_argument('--jmin',           type=int, default=None)
-    p.add_argument('--jmax',           type=int, default=None)
-    p.add_argument('--checksum',       action='store_true')
-    p.add_argument('--visualise',      action='store_true')
-    p.add_argument('--level',          type=int, default=0,
-                   help='Starting vertical level (k index); negative counts from top')
-    p.add_argument('--cmax',           type=float, default=None,
-                   help='Colour scale maximum (min fixed at 0); default: data-driven')
-    p.add_argument('--verbose',        action='store_true')
+    # shared flags (vtkout, tintegr, cfl, time-index, imin/imax/jmin/jmax,
+    #               checksum, visualise, level, cmax, verbose)
+    FtleBase.add_common_args(p, default_vtkout='wrf_ftle_idx.vts',
+                                default_tintegr=-3600.0)
     return p
 
 

@@ -752,9 +752,11 @@ class WrfFtle:
         heights_w = (ph + phb) / 9.81          # geopotential height at W-levels (m)
 
         # ── winds ─────────────────────────────────────────────────────────
-        U = ds['U'][ti].values.astype(np.float64)   # (nz, ny, nx+1)
-        V = ds['V'][ti].values.astype(np.float64)   # (nz, ny+1, nx)
-        W = ds['W'][ti].values.astype(np.float64)   # (nz+1, ny, nx)
+        # xarray converts _FillValue/missing_value to NaN; zero them out so
+        # degenerate cells don't corrupt face-flux computation downstream.
+        U = np.nan_to_num(ds['U'][ti].values.astype(np.float64), nan=0.0)  # (nz, ny, nx+1)
+        V = np.nan_to_num(ds['V'][ti].values.astype(np.float64), nan=0.0)  # (nz, ny+1, nx)
+        W = np.nan_to_num(ds['W'][ti].values.astype(np.float64), nan=0.0)  # (nz+1, ny, nx)
 
         if rotate:
             # Rotate Earth-relative → grid-relative using COSALPHA/SINALPHA.
