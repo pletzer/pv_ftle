@@ -1,7 +1,7 @@
 import re
 
-import netCDF4
 import numpy as np
+import xarray as xr
 
 from .uvw_base_reader import UVWBaseReader
 
@@ -9,8 +9,13 @@ from .uvw_base_reader import UVWBaseReader
 class UVWPalmReader(UVWBaseReader):
     """Reader for PALM NetCDF velocity output files.
 
-    Reads the minimum set of time steps from the file that fully spans
-    [tmin, tmax], keeping memory use low.
+    Accepts one or more files that cover the same spatial domain across
+    different time slices.  Multiple files are combined transparently via
+    :func:`xarray.open_mfdataset`, which concatenates them along the time
+    coordinate.
+
+    Reads the minimum set of time steps that fully spans [tmin, tmax],
+    keeping memory use low.
 
     C-grid staggering of the raw NetCDF arrays (nz1 = nz+1 corner count,
     ny1 = ny+1, nx1 = nx+1):
@@ -27,11 +32,15 @@ class UVWPalmReader(UVWBaseReader):
     replaced with zero on load.
     """
 
-    def __init__(self, filename: str, tmin: float, tmax: float,
+    def __init__(self, filenames: str | list[str], tmin: float, tmax: float,
                  zero_fill: bool = True):
         """
         Parameters
         ----------
+        filenames : str or list of str
+            Path(s) to PALM NetCDF output file(s).  A single string is
+            accepted for convenience.  Multiple files must cover the same
+            spatial domain and are concatenated along the time axis.
         zero_fill : bool
             If True (default), replace masked fill values (e.g. -9999 building
             cells) with zero.  This is physically correct: buildings have zero
@@ -39,7 +48,7 @@ class UVWPalmReader(UVWBaseReader):
             interpolation by mixing real velocities with the fill value.
             Set False only to reproduce pre-fix results.
         """
-        super().__init__(filename, tmin, tmax)
+        super().__init__(filenames, tmin, tmax)
         self.zero_fill = zero_fill
         # lazily populated on first access
         self._uface: np.ndarray | None = None
@@ -55,11 +64,11 @@ class UVWPalmReader(UVWBaseReader):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_nc_names(nc) -> dict:
-        """Discover u/v/w variable and dimension names in *nc*."""
+    def _get_var_names(ds: xr.Dataset) -> dict:
+        """Discover u/v/w variable and dimension names in an xarray Dataset."""
         res: dict = {}
-        for name, var in nc.variables.items():
-            units = getattr(var, 'units', '')
+        for name, var in ds.data_vars.items():
+            units = var.attrs.get('units', '')
             if re.match(r'^[Uu]', name) and units in ('m/s', 'm s-1'):
                 res['u'] = name
             elif re.match(r'^[Vv]', name) and units in ('m/s', 'm s-1'):
@@ -70,10 +79,10 @@ class UVWPalmReader(UVWBaseReader):
         for key in ('u', 'v', 'w'):
             if key not in res:
                 raise ValueError(f"Could not find '{key}' velocity variable (units m/s or m s-1)")
-            if len(nc.variables[res[key]].shape) != 4:
+            if len(ds[res[key]].dims) != 4:
                 raise ValueError(
                     f"Expected 4-D variable for '{key}', "
-                    f"got shape {nc.variables[res[key]].shape}"
+                    f"got dims {ds[res[key]].dims}"
                 )
 
         # Axis dimension names follow the same convention as palm_ftle.py:
@@ -81,10 +90,10 @@ class UVWPalmReader(UVWBaseReader):
         #   y  → v's second-to-last dim (face-y axis, staggered for v)
         #   z  → w's third-to-last dim
         #   t  → w's first dim
-        res['x'] = nc.variables[res['u']].dimensions[-1]
-        res['y'] = nc.variables[res['v']].dimensions[-2]
-        res['z'] = nc.variables[res['w']].dimensions[-3]
-        res['time'] = nc.variables[res['w']].dimensions[-4]
+        res['x'] = ds[res['u']].dims[-1]
+        res['y'] = ds[res['v']].dims[-2]
+        res['z'] = ds[res['w']].dims[-3]
+        res['time'] = ds[res['w']].dims[-4]
         return res
 
     def _time_slice(self, t_all: np.ndarray) -> slice:
@@ -102,42 +111,63 @@ class UVWPalmReader(UVWBaseReader):
         return slice(i_start, i_end + 1)
 
     @staticmethod
-    def _to_float32(arr, zero_fill: bool = False) -> np.ndarray:
-        """Convert a (possibly masked) NetCDF array to a plain float32 ndarray.
+    def _to_float32(arr: np.ndarray, zero_fill: bool = False) -> np.ndarray:
+        """Convert an array to a plain float32 ndarray, optionally zeroing NaNs.
 
         Parameters
         ----------
         zero_fill : bool
-            False (default): only genuine NaN values are replaced with zero;
-            masked fill values (e.g. -9999) are preserved in the output array.
-            True: masked slots are filled with zero before conversion, which is
-            physically correct for building cells but changes downstream results.
+            If True, NaN values (including those decoded from masked fill values
+            by xarray) are replaced with zero before conversion.  This is
+            physically correct for building cells.  If False, NaN values are
+            still replaced with zero by :func:`numpy.nan_to_num` but masked
+            fill values that were not decoded as NaN are preserved.
         """
         if zero_fill and hasattr(arr, 'filled'):
+            # support legacy masked arrays if they ever appear
             arr = arr.filled(0.0)
         return np.array(np.nan_to_num(arr, nan=0.0), dtype=np.float32)
 
     def _load(self) -> None:
-        """Open the file once and read coordinates plus the windowed velocity data."""
-        with netCDF4.Dataset(self.filename, 'r') as nc:
-            fld = self._get_nc_names(nc)
+        """Open the file(s) and read coordinates plus the windowed velocity data.
 
-            t_all = np.asarray(nc.variables[fld['time']][:])
+        Each file is opened individually with :func:`xarray.open_dataset`
+        (no dask required) and the resulting datasets are concatenated along
+        the time axis with :func:`xarray.concat` before any data is extracted.
+        """
+        individual = [xr.open_dataset(f) for f in self.filenames]
+        try:
+            # Discover variable/dimension names from the first file, then
+            # concatenate all files along the time dimension.
+            fld = self._get_var_names(individual[0])
+            ds = (individual[0] if len(individual) == 1
+                  else xr.concat(individual, dim=fld['time']))
+
+            t_all = ds[fld['time']].values.astype(np.float64)
             sl = self._time_slice(t_all)
 
-            self._taxis = np.array(t_all[sl], dtype=np.float64)
+            self._taxis = t_all[sl]
 
             # Corner axes – read in full (cheap compared to velocity data)
-            self._xaxis = np.array(nc.variables[fld['x']][:], dtype=np.float64)
-            self._yaxis = np.array(nc.variables[fld['y']][:], dtype=np.float64)
-            self._zaxis = np.array(nc.variables[fld['z']][:], dtype=np.float64)
+            self._xaxis = ds[fld['x']].values.astype(np.float64)
+            self._yaxis = ds[fld['y']].values.astype(np.float64)
+            self._zaxis = ds[fld['z']].values.astype(np.float64)
 
             # Velocity face fluxes – only the selected time window.
-            # Use .filled(0.0) before converting so that masked fill values
-            # (e.g. 9.96921e+36) are replaced with zero, not just NaNs.
-            self._uface = self._to_float32(nc.variables[fld['u']][sl], self.zero_fill)
-            self._vface = self._to_float32(nc.variables[fld['v']][sl], self.zero_fill)
-            self._wface = self._to_float32(nc.variables[fld['w']][sl], self.zero_fill)
+            # .values triggers the actual read while the files are still open.
+            time_dim = fld['time']
+            self._uface = self._to_float32(
+                ds[fld['u']].isel({time_dim: sl}).values, self.zero_fill
+            )
+            self._vface = self._to_float32(
+                ds[fld['v']].isel({time_dim: sl}).values, self.zero_fill
+            )
+            self._wface = self._to_float32(
+                ds[fld['w']].isel({time_dim: sl}).values, self.zero_fill
+            )
+        finally:
+            for d in individual:
+                d.close()
 
     def _ensure_loaded(self) -> None:
         if self._taxis is None:

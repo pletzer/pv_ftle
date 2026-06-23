@@ -14,8 +14,8 @@ import argparse
 import sys
 import os
 
-import netCDF4
 import numpy as np
+import xarray as xr
 
 # so that Python sees the shared libraries when run from source
 plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -70,9 +70,9 @@ def main():
     args = parser.parse_args()
 
     # --- minimal NC read: time axis only ------------------------------------
-    with netCDF4.Dataset(args.palmfile, "r") as nc:
-        fld = UVWPalmReader._get_nc_names(nc)
-        t_all = np.asarray(nc.variables[fld["time"]][:], dtype=np.float64)
+    with xr.open_dataset(args.palmfile) as ds:
+        fld = UVWPalmReader._get_var_names(ds)
+        t_all = ds[fld["time"]].values.astype(np.float64)
 
     nt = t_all.size
     if not (0 <= args.time_index < nt):

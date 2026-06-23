@@ -5,18 +5,23 @@ import numpy as np
 class UVWBaseReader(ABC):
     """Abstract base class for readers that provide velocity field data (U, V, W)."""
 
-    def __init__(self, filename: str, tmin: float, tmax: float):
+    def __init__(self, filenames: str | list[str], tmin: float, tmax: float):
         """
         Parameters
         ----------
-        filename : str
-            Path to the data file.
+        filenames : str or list of str
+            Path(s) to the data file(s).  A single string is accepted for
+            convenience and treated as a one-element list.  When multiple files
+            are given they should collectively span the desired spatial domain
+            and/or time range; they are combined automatically by the reader.
         tmin : float
             Start time for the time window of interest.
         tmax : float
             End time for the time window of interest.
         """
-        self.filename = filename
+        if isinstance(filenames, str):
+            filenames = [filenames]
+        self.filenames = filenames
         self.tmin = tmin
         self.tmax = tmax
 
