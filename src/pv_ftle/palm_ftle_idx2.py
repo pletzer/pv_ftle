@@ -59,7 +59,24 @@ class PalmFtleIdx(FtleBase):
         reader = UVWPalmReader(self.palmfile, tmin=t_val, tmax=t_val,
                                zero_fill=True)
         x_nodes, y_nodes, zaxis = reader.getAxes()   # zaxis = w face-z (zw_xy)
+        zuaxis = reader.getUVZAxis()                   # u/v cell-centre z (zu_xy)
         uface, vface, wface = reader.getFaceFluxes()  # (1, nz1, ny±1, nx±1)
+
+        # ── extend zw_xy if the bottom face is missing ────────────────────────
+        # zw_xy should bracket zu_xy: zw_xy[0] < zu_xy[0] < zw_xy[1].
+        # PALM sometimes omits the lowest face from the file output, leaving
+        # zw_xy[0] above zu_xy[0].  Reconstruct the missing face by reflection:
+        #   z_bottom = 2 * zu_xy[0] - zw_xy[0]
+        # and prepend a zero-velocity w slice (ground no-penetration BC).
+        # u and v also get a zero bottom slice so all arrays stay (nz1, …).
+        if zaxis[0] > zuaxis[0]:
+            z_bottom = 2.0 * float(zuaxis[0]) - float(zaxis[0])
+            zaxis = np.concatenate([[z_bottom], zaxis])
+            wface = np.concatenate([np.zeros_like(wface[:, :1]), wface], axis=1)
+            if self.verbose:
+                print(f'Extended zw_xy: prepended z_bottom={z_bottom:.2f} m  '
+                      f'(zu_xy[0]={float(zuaxis[0]):.2f} m  '
+                      f'old zw_xy[0]={float(zaxis[1]):.2f} m)')
 
         t1 = time.perf_counter()
 
@@ -78,7 +95,8 @@ class PalmFtleIdx(FtleBase):
         if self.verbose:
             print(f'PALM grid: {nz}×{ny}×{nx} cells  '
                   f'dx={dx:.1f} m  dy={dy:.1f} m  '
-                  f'dz={dz.min():.1f}–{dz.max():.1f} m')
+                  f'dz={dz.min():.1f}–{dz.max():.1f} m  '
+                  f'zw_xy[0]={zaxis[0]:.2f} m')
 
         # ── seed sub-region ───────────────────────────────────────────────────
         imin, imax, jmin, jmax = FtleBase._resolve_indices(

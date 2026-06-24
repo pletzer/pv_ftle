@@ -234,6 +234,7 @@ class PalmFtleIdx(FtleBase):
         super().__init__()
         self.palmfile    = ""
         self.tintegr     = -10.0     # override default (PALM domains smaller)
+        self.seed_zw     = False     # if True, seed on zw_xy (face/corner z) instead of zu_xy
 
     # ── compute ───────────────────────────────────────────────────────────────
 
@@ -294,6 +295,17 @@ class PalmFtleIdx(FtleBase):
         if self.verbose:
             print(f'z convention: case {z_case}  z_corners[0]={z_corners[0]:.2f} m  '
                   f'z_corners[-1]={z_corners[-1]:.2f} m  nz={nz}')
+
+        # ── optional: re-seed on zw_xy (face/corner axis) ────────────────────
+        # Overrides the z_corners determined above with the w face-z axis
+        # (zw_raw = zw_xy).  Use this to match palm_ftle_idx2 which seeds at
+        # cell corners rather than cell centres.
+        if self.seed_zw:
+            z_corners = np.ascontiguousarray(zw_raw, dtype=np.float64)
+            nz = len(z_corners) - 1
+            if self.verbose:
+                print(f'seed_zw=True: z_corners overridden with zw_xy  '
+                      f'z_corners[0]={z_corners[0]:.2f} m  nz={nz}')
 
         t1 = time.perf_counter()
 
@@ -437,7 +449,8 @@ class PalmFtleIdx(FtleBase):
 
 def main(*, palmfile, vtkout='palm_ftle_idx.vts', tintegr=-10.0, cfl=0.25,
          time_index=0, imin=None, imax=None, jmin=None, jmax=None,
-         checksum=False, visualise=False, level=0, cmax=None, verbose=False):
+         checksum=False, visualise=False, level=0, cmax=None,
+         seed_zw=False, verbose=False):
 
     pf = PalmFtleIdx()
     pf.palmfile    = palmfile
@@ -450,6 +463,7 @@ def main(*, palmfile, vtkout='palm_ftle_idx.vts', tintegr=-10.0, cfl=0.25,
     pf.jmax        = jmax
     pf.checksum    = checksum
     pf.cmax        = cmax
+    pf.seed_zw     = seed_zw
     pf.verbose     = verbose
 
     result = pf.compute()
@@ -478,6 +492,13 @@ def build_parser():
     FtleBase.add_common_args(p,
                              default_vtkout='palm_ftle_idx.vts',
                              default_tintegr=-10.0)
+    g_zw = p.add_mutually_exclusive_group()
+    g_zw.add_argument('--seed-zw', dest='seed_zw', action='store_true',
+                      help='Seed on zw_xy (face/corner z axis) instead of zu_xy. '
+                           'Matches palm_ftle_idx2 seeding convention.')
+    g_zw.add_argument('--no-seed-zw', dest='seed_zw', action='store_false',
+                      help='Seed on zu_xy (cell-centre z axis, default).')
+    p.set_defaults(seed_zw=False)
     return p
 
 
@@ -494,6 +515,7 @@ def cli():
          visualise=args.visualise,
          level=args.level,
          cmax=args.cmax,
+         seed_zw=args.seed_zw,
          verbose=args.verbose)
 
 
