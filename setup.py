@@ -41,12 +41,16 @@ setup(
     entry_points={
         "console_scripts": [
             "palm_ftle=pv_ftle.palm_ftle:cli",
+            "palm_ftle_idx=pv_ftle.palm_ftle_idx:cli",
+            "wrf_ftle_idx=pv_ftle.wrf_ftle_idx:cli",
+            "wrf_ftle=pv_ftle.wrf_ftle:cli",
+            "palm_uv_plotter=pv_ftle.palm_uv_plotter:cli",
         ]
     },
     ext_modules=[CMakeExtension("pv_ftle._ftlecpp", sourcedir="cpp")],
     cmdclass={"build_ext": CMakeBuild},
     install_requires=[
-        "numpy>=1.22",
+        "numpy>=1.25",
         "netCDF4>=1.7",
         "vtk>=9.2",
         "memory_profiler",
