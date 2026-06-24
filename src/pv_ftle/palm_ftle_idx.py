@@ -6,9 +6,9 @@ ftlecpp.integrate_rk4 kernel as palm_ftle.py.  Cell lookup is O(1) in x and
 y (uniform horizontal grid) and O(log nz) in z (binary search on the
 non-uniform vertical axis).
 
-The velocity field is a single frozen time snapshot loaded via UVWPalmReader.
-Time-interpolated integration is not yet supported here; use palm_ftle.py for
-that.
+By default the velocity field evolves in time across the integration window
+(same as palm_ftle.py).  Pass --frozen to fix the velocity at the selected
+snapshot instead.
 
 VTK output is a pyvista StructuredGrid (.vts) whose corner nodes are the
 physical seed positions.
@@ -40,23 +40,44 @@ class PalmFtleIdx(FtleBase):
         super().__init__()
         self.palmfile = ""
         self.tintegr  = -10.0     # override default (PALM domains are smaller)
+        self.frozen   = False     # if True, fix velocity at the selected snapshot
 
     # ── compute ───────────────────────────────────────────────────────────────
 
     def compute(self):
         t0 = time.perf_counter()
 
-        # ── resolve the time value for this snapshot ──────────────────────────
+        # ── resolve time window ───────────────────────────────────────────────
         # Open once with xarray (lightweight) to read only the time coordinate.
         with xr.open_dataset(self.palmfile) as ds:
             fld_names = UVWPalmReader._get_var_names(ds)
             t_all = ds[fld_names['time']].values.astype(np.float64)
 
-        t_val = float(t_all[self.time_index])
+        t_val  = float(t_all[self.time_index])
+        nt_all = len(t_all)
+
+        if self.frozen:
+            tmin = tmax = t_val
+        else:
+            if nt_all < 2:
+                raise ValueError('Time-dependent integration requires at least '
+                                  '2 time steps in the file; use --frozen instead.')
+            dt_file = float(t_all[1] - t_all[0])
+            di      = int(np.ceil(abs(self.tintegr) / dt_file))
+            if self.tintegr < 0:
+                tmin_idx = max(self.time_index - di, 0)
+                tmax_idx = self.time_index
+            else:
+                tmin_idx = self.time_index
+                tmax_idx = min(self.time_index + di, nt_all - 1)
+            tmin = float(t_all[tmin_idx])
+            tmax = float(t_all[tmax_idx])
+            if self.verbose:
+                print(f'Time window: [{tmin:.1f}, {tmax:.1f}] s  '
+                      f'({tmax_idx - tmin_idx + 1} snapshots)')
 
         # ── load axes and velocity via UVWPalmReader ──────────────────────────
-        # tmin == tmax selects exactly one time step.
-        reader = UVWPalmReader(self.palmfile, tmin=t_val, tmax=t_val,
+        reader = UVWPalmReader(self.palmfile, tmin=tmin, tmax=tmax,
                                zero_fill=True)
         x_nodes, y_nodes, zaxis = reader.getAxes()   # zaxis = w face-z (zw_xy)
         zuaxis = reader.getUVZAxis()                   # u/v cell-centre z (zu_xy)
@@ -147,7 +168,7 @@ class PalmFtleIdx(FtleBase):
         t2 = time.perf_counter()
 
         # ── RK4 trajectory integration (C++) ─────────────────────────────────
-        # frozen=True: single time snapshot, time_index0 = time_index1 = 0.
+        t_axis_f = np.array(reader.getTimeAxis(), dtype=np.float32)
         xyz = ftlecpp.integrate_rk4(
             xyz0,
             float(t_val),
@@ -163,8 +184,8 @@ class PalmFtleIdx(FtleBase):
             nx1_full,
             ny1_full,
             nz1,
-            True,                                      # frozen
-            np.array([t_val], dtype=np.float32),       # t_axis (single entry)
+            self.frozen,
+            t_axis_f,
         )
 
         t3 = time.perf_counter()
@@ -224,7 +245,8 @@ class PalmFtleIdx(FtleBase):
 
 def main(*, palmfile, vtkout='palm_ftle_idx.vts', tintegr=-10.0, cfl=0.25,
          time_index=0, imin=None, imax=None, jmin=None, jmax=None,
-         checksum=False, visualise=False, level=0, cmax=None, verbose=False):
+         checksum=False, visualise=False, level=0, cmax=None,
+         frozen=False, verbose=False):
 
     pf = PalmFtleIdx()
     pf.palmfile   = palmfile
@@ -237,6 +259,7 @@ def main(*, palmfile, vtkout='palm_ftle_idx.vts', tintegr=-10.0, cfl=0.25,
     pf.jmax       = jmax
     pf.checksum   = checksum
     pf.cmax       = cmax
+    pf.frozen     = frozen
     pf.verbose    = verbose
 
     result = pf.compute()
@@ -260,11 +283,19 @@ def main(*, palmfile, vtkout='palm_ftle_idx.vts', tintegr=-10.0, cfl=0.25,
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description='PALM FTLE – C++ RK4 integration, frozen velocity snapshot.')
+        description='PALM FTLE – C++ RK4 integration with optional time interpolation.')
     p.add_argument('palmfile')
     FtleBase.add_common_args(p,
                              default_vtkout='palm_ftle_idx.vts',
                              default_tintegr=-10.0)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--frozen', dest='frozen', action='store_true',
+                   help='Fix velocity at the selected snapshot (faster, '
+                        'no multi-step file read).')
+    g.add_argument('--no-frozen', dest='frozen', action='store_false',
+                   help='Interpolate velocity in time across the integration '
+                        'window (default).')
+    p.set_defaults(frozen=False)
     return p
 
 
@@ -281,6 +312,7 @@ def cli():
          visualise=args.visualise,
          level=args.level,
          cmax=args.cmax,
+         frozen=args.frozen,
          verbose=args.verbose)
 
 

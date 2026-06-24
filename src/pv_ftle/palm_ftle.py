@@ -225,8 +225,23 @@ NetCDF variable names:
             zero_fill=self.zero_fill,
         )
         xaxis_full, yaxis_full, zaxis = reader.getAxes()
+        zuaxis = reader.getUVZAxis()
         t_axis = reader.getTimeAxis()
         uface, vface, wface = reader.getFaceFluxes()
+
+        # ── extend zw_xy if the bottom face is missing ────────────────────────
+        # zw_xy should bracket zu_xy: zw_xy[0] < zu_xy[0] < zw_xy[1].
+        # PALM sometimes omits the lowest face; reconstruct it by reflection:
+        #   z_bottom = 2 * zu_xy[0] - zw_xy[0]
+        # and prepend a zero-velocity w slice (ground no-penetration BC).
+        if zaxis[0] > zuaxis[0]:
+            z_bottom = 2.0 * float(zuaxis[0]) - float(zaxis[0])
+            zaxis = np.concatenate([[z_bottom], zaxis])
+            wface = np.concatenate([np.zeros_like(wface[:, :1]), wface], axis=1)
+            if self.verbose:
+                print(f'Extended zw_xy: prepended z_bottom={z_bottom:.2f} m  '
+                      f'(zu_xy[0]={float(zuaxis[0]):.2f} m  '
+                      f'old zw_xy[0]={float(zaxis[1]):.2f} m)')
 
         tm1 = time.perf_counter()
 
@@ -292,7 +307,7 @@ w: shape={wface_clean.shape} type={wface_clean.dtype}''')
         # --------------------------------------------------------------
         # Runge-Kutta 4 trajectory integration
         # --------------------------------------------------------------
-        time_val = t_axis_clean[0]   # start of selected window
+        time_val = float(t_all[self.time_index])   # snapshot time (RK4 steps backward/forward from here)
         dt_step = self.tintegr / nsteps
         xyz = ftlecpp.integrate_rk4(
             xyz0,
