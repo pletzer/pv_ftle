@@ -38,12 +38,11 @@ extension with a pure-Python/Numba pipeline and removes time-interpolation
 """
 
 import math
-import re
 import argparse
 import time
 
 import numpy as np
-import netCDF4
+import xarray as xr
 from numba import njit, prange
 
 from ftle_common import (
@@ -52,6 +51,7 @@ from ftle_common import (
     compute_ftle,
     FtleBase,
 )
+from pv_ftle.uvw_palm_reader import UVWPalmReader
 
 
 # ── PALM-specific Numba kernels ───────────────────────────────────────────────
@@ -235,134 +235,65 @@ class PalmFtleIdx(FtleBase):
         self.palmfile    = ""
         self.tintegr     = -10.0     # override default (PALM domains smaller)
 
-    # ── NetCDF helpers ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _get_nc_names(nc, verbose=False):
-        """
-        Auto-detect u/v/w variable names and axis dimension names.
-        Mirrors palm_ftle.py's get_nc_names().
-        """
-        res = {}
-        for name, var in nc.variables.items():
-            units = getattr(var, 'units', '')
-            if units not in ('m/s', 'm s-1'):
-                continue
-            if re.match(r'^[Uu]', name):
-                res.setdefault('u', name)
-            elif re.match(r'^[Vv]', name):
-                res.setdefault('v', name)
-            elif re.match(r'^[Ww]', name):
-                res.setdefault('w', name)
-
-        for key in ('u', 'v', 'w'):
-            if key not in res:
-                raise ValueError(f'Could not find {key} velocity in NetCDF')
-
-        dims = nc.variables[res['u']].dimensions
-        if len(dims) != 4:
-            raise ValueError(f'Expected 4D u field (t,z,y,x), got {dims}')
-
-        res['time'] = dims[-4]
-        res['z']    = dims[-3]   # z axis for u/v (and seeds)
-        res['y']    = dims[-2]
-        res['x']    = dims[-1]
-
-        # w may live on a different vertical axis (zw vs zu in PALM C-grid).
-        # Read its z dimension separately so we can handle the stagger.
-        w_dims = nc.variables[res['w']].dimensions
-        res['zw'] = w_dims[-3]   # may equal res['z'] if cross-section already interpolated
-
-        if verbose:
-            print('NetCDF field names:', res)
-            if res['zw'] != res['z']:
-                print(f"  NOTE: w uses z-axis '{res['zw']}' (differs from u/v '{res['z']}')")
-        return res
-
     # ── compute ───────────────────────────────────────────────────────────────
 
     def compute(self):
         t0 = time.perf_counter()
 
-        with netCDF4.Dataset(self.palmfile, 'r') as nc:
-            fld = PalmFtleIdx._get_nc_names(nc, self.verbose)
+        # ── resolve the time value for this snapshot ──────────────────────────
+        # Open once with xarray (lightweight) to read only the time coordinate,
+        # then hand the actual data loading to UVWPalmReader.
+        with xr.open_dataset(self.palmfile) as ds:
+            fld_names = UVWPalmReader._get_var_names(ds)
+            t_all = ds[fld_names['time']].values.astype(np.float64)
 
-            # ── read axes ────────────────────────────────────────────────────
-            # PALM stores node positions; treat them as corners for seeding
-            # (consistent with palm_ftle.py).
-            x_nodes = np.array(nc.variables[fld['x']][:], dtype=np.float64)
-            y_nodes = np.array(nc.variables[fld['y']][:], dtype=np.float64)
-            z_raw   = np.array(nc.variables[fld['z']][:], dtype=np.float64)
-            # Read w's own z axis (may be zw ≠ zu)
-            zw_raw  = np.array(nc.variables[fld['zw']][:], dtype=np.float64)
-            if self.verbose and fld['zw'] != fld['z']:
-                print(f"  z (u/v): {z_raw[:4]} …  z (w): {zw_raw[:4]} …")
+        t_val = float(t_all[self.time_index])
 
-            nx = len(x_nodes) - 1   # cells = corners - 1
-            ny = len(y_nodes) - 1
-            nz = len(z_raw)   - 1   # z_raw may already be corners or centers
+        # ── load axes and velocity via UVWPalmReader ──────────────────────────
+        reader = UVWPalmReader(self.palmfile, tmin=t_val, tmax=t_val,
+                               zero_fill=True)
+        x_nodes, y_nodes, zw_raw = reader.getAxes()     # zw_raw = w face-z (zw_xy)
+        z_raw = reader.getUVZAxis()                      # z_raw  = u/v cell-centre z (zu_xy)
+        uface, vface, wface = reader.getFaceFluxes()
 
-            if self.verbose:
-                print(f'PALM grid: {nz}×{ny}×{nx} cells')
+        # The reader window contains exactly one time step → take index 0
+        U_raw = np.array(uface[0], dtype=np.float64)    # (nz1, ny1, nx )
+        V_raw = np.array(vface[0], dtype=np.float64)    # (nz1, ny,  nx1)
+        W_raw = np.array(wface[0], dtype=np.float64)    # (nz1, ny1, nx1)
 
-            # ── z-corners ────────────────────────────────────────────────────
-            # Two conventions in PALM cross-section output:
-            #
-            # Case A (z_raw has nz+1 values): z_raw IS the node/face positions
-            #   (e.g. zu_xy). Seeds are placed at these heights directly — the
-            #   first seed is at zu_xy[0] > 0, matching palm_ftle.py exactly.
-            #   W[k] is also at zu_xy[k], so no averaging is needed; we keep all
-            #   nz+1 levels.  This is the common case for PALM cross-sections.
-            #
-            # Case B (z_raw has nz values): z_raw are cell-centre heights.
-            #   Derive corners via build_palm_corner_z; z_corners[0] = 0 (ground).
-            #   W is cell-centred and must be converted to face-centred.
-            nz_raw = len(z_raw)
-            if nz_raw == nz + 1:
-                z_corners = z_raw        # Case A: node positions already
-                z_case = 'A'
-            else:
-                nz = nz_raw              # Case B: nz was one too small
-                z_corners = build_palm_corner_z(z_raw)
-                z_case = 'B'
-            if self.verbose:
-                print(f'z convention: case {z_case}  z_corners[0]={z_corners[0]:.2f} m  '
-                      f'z_corners[-1]={z_corners[-1]:.2f} m  nz={nz}')
+        if self.verbose and not np.array_equal(z_raw, zw_raw):
+            print(f"  z (u/v): {z_raw[:4]} …  z (w): {zw_raw[:4]} …")
 
-            # ── read velocities (single time snapshot) ────────────────────
-            # Two-stage fill-value removal:
-            # 1) np.ma.filled()  — handles properly masked arrays
-            # 2) explicit _FillValue check — handles the common PALM case where
-            #    dtype mismatch (int _FillValue on float variable) causes
-            #    netCDF4 auto-masking to silently fail, leaving the sentinel
-            #    (e.g. 9999.0) as unmasked data.
-            ti = self.time_index
-            def _read_vel(name):
-                """
-                Read velocity variable, zero out fill/masked cells, and return
-                both the cleaned array and a boolean building mask.
+        nx = len(x_nodes) - 1   # cells = corners - 1
+        ny = len(y_nodes) - 1
+        nz = len(z_raw)   - 1   # z_raw may be corners (nz+1) or centres (nz)
 
-                The mask is True wherever the original data was masked OR equal
-                to the _FillValue sentinel — i.e. inside buildings / outside
-                the domain.  It is used to enforce zero flux at building faces.
-                """
-                var = nc.variables[name]
-                raw = var[ti]
-                # Stage 1: masked array fill
-                bld = np.ma.getmaskarray(raw).copy()   # True = building/fill
-                arr = np.ma.filled(raw, fill_value=0.0).astype(np.float64)
-                # Stage 2: explicit sentinel (dtype mismatch bypasses auto-mask)
-                fv = getattr(var, '_FillValue', None)
-                if fv is not None:
-                    sentinel = float(fv)
-                    hit = arr == sentinel
-                    bld |= hit
-                    arr[hit] = 0.0
-                return arr, bld
+        if self.verbose:
+            print(f'PALM grid: {nz}×{ny}×{nx} cells')
 
-            U_raw, _     = _read_vel(fld['u'])   # building mask not needed for U
-            V_raw, _     = _read_vel(fld['v'])   # nor for V (already zeroed)
-            W_raw, W_bld = _read_vel(fld['w'])   # W mask used for face construction
+        # ── z-corners ────────────────────────────────────────────────────────
+        # Two conventions in PALM cross-section output:
+        #
+        # Case A (z_raw has nz+1 values): z_raw IS the node/face positions
+        #   (e.g. zu_xy). Seeds are placed at these heights directly — the
+        #   first seed is at zu_xy[0] > 0, matching palm_ftle.py exactly.
+        #   W[k] is also at zu_xy[k], so no averaging is needed; we keep all
+        #   nz+1 levels.  This is the common case for PALM cross-sections.
+        #
+        # Case B (z_raw has nz values): z_raw are cell-centre heights.
+        #   Derive corners via build_palm_corner_z; z_corners[0] = 0 (ground).
+        #   W is cell-centred and must be converted to face-centred.
+        nz_raw = len(z_raw)
+        if nz_raw == nz + 1:
+            z_corners = z_raw        # Case A: node positions already
+            z_case = 'A'
+        else:
+            nz = nz_raw              # Case B: nz was one too small
+            z_corners = build_palm_corner_z(z_raw)
+            z_case = 'B'
+        if self.verbose:
+            print(f'z convention: case {z_case}  z_corners[0]={z_corners[0]:.2f} m  '
+                  f'z_corners[-1]={z_corners[-1]:.2f} m  nz={nz}')
 
         t1 = time.perf_counter()
 

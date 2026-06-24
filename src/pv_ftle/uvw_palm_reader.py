@@ -54,10 +54,11 @@ class UVWPalmReader(UVWBaseReader):
         self._uface: np.ndarray | None = None
         self._vface: np.ndarray | None = None
         self._wface: np.ndarray | None = None
-        self._xaxis: np.ndarray | None = None
-        self._yaxis: np.ndarray | None = None
-        self._zaxis: np.ndarray | None = None
-        self._taxis: np.ndarray | None = None
+        self._xaxis:  np.ndarray | None = None
+        self._yaxis:  np.ndarray | None = None
+        self._zaxis:  np.ndarray | None = None   # w face-z axis (zw_xy)
+        self._zuaxis: np.ndarray | None = None   # u/v cell-centre z axis (zu_xy)
+        self._taxis:  np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -85,14 +86,17 @@ class UVWPalmReader(UVWBaseReader):
                     f"got dims {ds[res[key]].dims}"
                 )
 
-        # Axis dimension names follow the same convention as palm_ftle.py:
-        #   x  → u's last dim   (face-x axis, staggered for u)
-        #   y  → v's second-to-last dim (face-y axis, staggered for v)
-        #   z  → w's third-to-last dim
-        #   t  → w's first dim
-        res['x'] = ds[res['u']].dims[-1]
-        res['y'] = ds[res['v']].dims[-2]
-        res['z'] = ds[res['w']].dims[-3]
+        # Axis dimension names:
+        #   x   → u's last dim          (face-x axis, staggered for u)
+        #   y   → v's second-to-last dim (face-y axis, staggered for v)
+        #   z   → w's third-to-last dim  (w face-z axis, e.g. zw_xy in PALM)
+        #   zu  → u's third-to-last dim  (u/v cell-centre z axis, e.g. zu_xy in PALM)
+        #         equals 'z' when w and u/v share the same vertical axis
+        #   t   → w's first dim
+        res['x']    = ds[res['u']].dims[-1]
+        res['y']    = ds[res['v']].dims[-2]
+        res['z']    = ds[res['w']].dims[-3]
+        res['zu']   = ds[res['u']].dims[-3]
         res['time'] = ds[res['w']].dims[-4]
         return res
 
@@ -149,9 +153,10 @@ class UVWPalmReader(UVWBaseReader):
             self._taxis = t_all[sl]
 
             # Corner axes – read in full (cheap compared to velocity data)
-            self._xaxis = ds[fld['x']].values.astype(np.float64)
-            self._yaxis = ds[fld['y']].values.astype(np.float64)
-            self._zaxis = ds[fld['z']].values.astype(np.float64)
+            self._xaxis  = ds[fld['x']].values.astype(np.float64)
+            self._yaxis  = ds[fld['y']].values.astype(np.float64)
+            self._zaxis  = ds[fld['z']].values.astype(np.float64)   # w face-z (zw_xy)
+            self._zuaxis = ds[fld['zu']].values.astype(np.float64)  # u/v cell-centre z (zu_xy)
 
             # Velocity face fluxes – only the selected time window.
             # .values triggers the actual read while the files are still open.
@@ -192,14 +197,24 @@ class UVWPalmReader(UVWBaseReader):
         return self._uface, self._vface, self._wface
 
     def getAxes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return the 1-D corner coordinate axes (x, y, z).
+        """Return the 1-D coordinate axes (x, y, z).
 
-        Sizes match the last dimension of u, the second-to-last of v, and
-        the third-to-last of w respectively (all corner/face axes as stored
-        in the PALM NetCDF file).
+        x matches u's last dimension, y matches v's second-to-last, and z
+        is the w face-z axis (zw_xy in PALM).  For the u/v cell-centre z axis
+        (zu_xy) use :meth:`getUVZAxis`.
         """
         self._ensure_loaded()
         return self._xaxis, self._yaxis, self._zaxis
+
+    def getUVZAxis(self) -> np.ndarray:
+        """Return the u/v cell-centre z axis (zu_xy in PALM).
+
+        This differs from the z returned by :meth:`getAxes` when w lives on a
+        separate face-z grid (zw_xy ≠ zu_xy).  When both variables share the
+        same vertical axis the two arrays are identical.
+        """
+        self._ensure_loaded()
+        return self._zuaxis
 
     def getCartesianCoords(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return 3-D Cartesian coordinate arrays on the corner grid.
