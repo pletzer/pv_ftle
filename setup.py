@@ -50,7 +50,7 @@ setup(
     ext_modules=[CMakeExtension("pv_ftle._ftlecpp", sourcedir="cpp")],
     cmdclass={"build_ext": CMakeBuild},
     install_requires=[
-        "numpy>=1.22",
+        "numpy>=1.25",
         "netCDF4>=1.7",
         "vtk>=9.2",
         "memory_profiler",

@@ -17,8 +17,8 @@ physical seed positions.
 import argparse
 import time
 
+import netCDF4
 import numpy as np
-import xarray as xr
 
 from ftle_common import FtleBase
 from pv_ftle import _ftlecpp as ftlecpp
@@ -48,10 +48,10 @@ class PalmFtleIdx(FtleBase):
         t0 = time.perf_counter()
 
         # ── resolve time window ───────────────────────────────────────────────
-        # Open once with xarray (lightweight) to read only the time coordinate.
-        with xr.open_dataset(self.palmfile) as ds:
-            fld_names = UVWPalmReader._get_var_names(ds)
-            t_all = ds[fld_names['time']].values.astype(np.float64)
+        # Open once with netCDF4 (lightweight) to read only the time coordinate.
+        with netCDF4.Dataset(self.palmfile) as nc:
+            fld_names = UVWPalmReader._get_var_names(nc)
+            t_all = np.asarray(nc.variables[fld_names['time']][:], dtype=np.float64)
 
         t_val  = float(t_all[self.time_index])
         nt_all = len(t_all)
