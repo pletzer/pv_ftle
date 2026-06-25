@@ -346,6 +346,71 @@ def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
     )
 
 
+# ── coastline helper ──────────────────────────────────────────────────────────
+
+def add_coastlines(pl, resolution='10m', altitude=10_000.0,
+                   color='cyan', line_width=2.0, verbose=False):
+    """
+    Overlay Natural Earth coastlines on a PyVista plotter whose scene is in
+    ECEF coordinates (metres from Earth's centre).
+
+    Parameters
+    ----------
+    pl         : pyvista.Plotter
+    resolution : '10m' | '50m' | '110m'  — Natural Earth resolution
+    altitude   : float  — metres above the ellipsoid; must clear terrain
+                          (default 10 km safely above any WRF surface level)
+    color      : PyVista colour spec for the lines
+    line_width : float
+    verbose    : bool
+    """
+    import pyvista as pv
+    try:
+        import cartopy.io.shapereader as shpreader
+    except ImportError:
+        import warnings
+        warnings.warn('cartopy not found — coastlines skipped. '
+                      'Install with: pip install cartopy')
+        return
+
+    # WGS-84 parameters
+    a  = 6_378_137.0
+    b  = 6_356_752.3142
+    e2 = 1.0 - (b / a) ** 2
+
+    def _to_ecef(lon_deg, lat_deg):
+        lo = np.radians(lon_deg)
+        la = np.radians(lat_deg)
+        N  = a / np.sqrt(1.0 - e2 * np.sin(la) ** 2)
+        r  = N + altitude
+        x  = r * np.cos(la) * np.cos(lo)
+        y  = r * np.cos(la) * np.sin(lo)
+        z  = (N * (1.0 - e2) + altitude) * np.sin(la)
+        return np.stack([x, y, z], axis=-1)
+
+    shpfile = shpreader.natural_earth(resolution=resolution,
+                                      category='physical', name='coastline')
+    n_segs = 0
+    for geom in shpreader.Reader(shpfile).geometries():
+        coords = np.array(geom.coords)
+        if len(coords) < 2:
+            continue
+        pts   = _to_ecef(coords[:, 0], coords[:, 1])
+        n     = len(pts)
+        cells = np.empty(3 * (n - 1), dtype=np.int_)
+        cells[0::3] = 2
+        cells[1::3] = np.arange(n - 1)
+        cells[2::3] = np.arange(1, n)
+        seg = pv.PolyData()
+        seg.points = pts
+        seg.lines  = cells
+        pl.add_mesh(seg, color=color, line_width=line_width,
+                    render_lines_as_tubes=False)
+        n_segs += 1
+    if verbose:
+        print(f'Coastlines: {n_segs} segments added at altitude={altitude:.0f} m')
+
+
 # ── main class ────────────────────────────────────────────────────────────────
 
 class WrfFtleIdx(FtleBase):
@@ -624,6 +689,7 @@ class WrfFtleIdx(FtleBase):
         pl.camera.focal_point = centroid.tolist()
         pl.camera.up          = cam_up.tolist()
 
+        add_coastlines(pl, verbose=self.verbose)
         pl.show()
 
 
