@@ -74,6 +74,13 @@ from wrf_ftle import (
     _get_corners_nb,
 )
 
+# ── C++ integrator (optional — falls back to Numba if not yet compiled) ───────
+try:
+    from pv_ftle import _ftlecpp as _ftlecpp
+    _HAVE_CPP = True
+except ImportError:
+    _HAVE_CPP = False
+
 
 # ── reference-space Numba kernels ─────────────────────────────────────────────
 
@@ -224,24 +231,15 @@ def _load_snapshot_fluxes(fname, r_corners, rotate, lats_shape, lons_shape):
     return compute_face_fluxes(U, V, W, r_corners), max_spd
 
 
-# ── time-dependent RK4 integrator ────────────────────────────────────────────
+# ── time-dependent RK4 integrators ───────────────────────────────────────────
 
-def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
-                            fluxes_list, t_snapshots,
-                            r_corners, shape,
-                            frozen=False, verbose=False):
+def _wrf_integrate_timedep_nb(seeds_ref, t0, dt, nsteps,
+                               fluxes_list, t_snapshots,
+                               r_corners, shape,
+                               frozen=False, verbose=False):
     """
-    RK4 in reference space with optional linear interpolation between snapshots.
-
-    seeds_ref   : (N, 3) float64  initial reference positions
-    t0          : float           start time [s]
-    dt          : float           RK4 step size [s], signed
-    nsteps      : int
-    fluxes_list : list[dict]      one flux dict per entry in t_snapshots
-    t_snapshots : 1-D array       snapshot times [s], monotone ascending
-    frozen      : bool            if True, always use fluxes_list[0] (t0 snapshot)
-
-    Returns (N, 3) float64 final reference positions.
+    Numba/Python fallback RK4 in reference space with linear time interpolation.
+    Used when the C++ extension is not available.
     """
     nz, ny, nx = shape
     rc  = np.ascontiguousarray(r_corners, dtype=np.float64)
@@ -249,7 +247,6 @@ def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
     ts  = np.asarray(t_snapshots, dtype=np.float64)
     nsnap = len(fluxes_list)
 
-    # Pre-convert all flux arrays to float64 contiguous
     farr = [
         {k: np.ascontiguousarray(v, dtype=np.float64) for k, v in f.items()}
         for f in fluxes_list
@@ -259,14 +256,12 @@ def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
         if frozen or nsnap == 1:
             f = farr[0]
         else:
-            # Find bracketing snapshot pair by bisection
             idx = int(np.searchsorted(ts, t, side='right')) - 1
             idx = max(0, min(idx, nsnap - 2))
             t0s, t1s = ts[idx], ts[idx + 1]
             alpha = float((t - t0s) / (t1s - t0s)) if t1s > t0s else 0.0
             alpha = max(0.0, min(1.0, alpha))
             f0, f1 = farr[idx], farr[idx + 1]
-            # Linear interpolation of face fluxes
             f = {k: (1.0 - alpha) * f0[k] + alpha * f1[k] for k in f0}
         return _ref_velocity_nb(pos,
                                 f['xi_m'], f['xi_p'],
@@ -289,6 +284,66 @@ def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
         pos = pos_new
         t += dt
     return pos
+
+
+def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
+                            fluxes_list, t_snapshots,
+                            r_corners, shape,
+                            frozen=False, verbose=False):
+    """
+    Dispatch to C++ integrator (ftlecpp.integrate_rk4_curvilinear) when
+    available, otherwise fall back to the Numba/Python implementation.
+
+    The C++ version fuses all four RK4 k-evaluations into a single OpenMP
+    parallel loop per step, avoiding repeated fork/join overhead and keeping
+    intermediate positions in registers.
+    """
+    if _HAVE_CPP:
+        nz, ny, nx = shape
+        nt = len(fluxes_list)
+
+        # Stack per-snapshot fluxes into (nt, nz, ny, nx) float32 arrays
+        def _stack(key):
+            return np.ascontiguousarray(
+                np.stack([f[key] for f in fluxes_list], axis=0), dtype=np.float32)
+
+        fxm = _stack('xi_m'); fxp = _stack('xi_p')
+        fem = _stack('et_m'); fep = _stack('et_p')
+        fzm = _stack('zt_m'); fzp = _stack('zt_p')
+
+        # Flat seeds: [p0..pN, q0..qN, r0..rN]  (seeds are at integer corners
+        # so exact in float32; intermediate positions get float32 arithmetic)
+        N = len(seeds_ref)
+        xyz0 = np.ascontiguousarray(
+            np.concatenate([seeds_ref[:, 0],
+                            seeds_ref[:, 1],
+                            seeds_ref[:, 2]]), dtype=np.float32)
+
+        rc_f32 = np.ascontiguousarray(r_corners, dtype=np.float32)
+        t_ax   = np.asarray(t_snapshots, dtype=np.float32)
+
+        flat = _ftlecpp.integrate_rk4_curvilinear(
+            xyz0,
+            float(t0), float(dt), nsteps,
+            rc_f32,
+            fxm, fxp, fem, fep, fzm, fzp,
+            t_ax, frozen,
+        )
+
+        # Rebuild (N, 3) float64 for downstream _ref_to_cart_nb
+        return np.stack([flat[:N],
+                         flat[N:2*N],
+                         flat[2*N:]], axis=-1).astype(np.float64)
+
+    # ── Numba fallback ────────────────────────────────────────────────────
+    if verbose:
+        print('  (ftlecpp not available — using Numba fallback)')
+    return _wrf_integrate_timedep_nb(
+        seeds_ref, t0, dt, nsteps,
+        fluxes_list, t_snapshots,
+        r_corners, shape,
+        frozen=frozen, verbose=verbose,
+    )
 
 
 # ── main class ────────────────────────────────────────────────────────────────
@@ -532,14 +587,24 @@ class WrfFtleIdx(FtleBase):
 
         # ── nadir camera: look straight down at the domain ────────────────
         # Centroid of the bottom seed level gives the domain centre in ECEF.
-        centroid = rc[0].reshape(-1, 3).mean(axis=0)
+        pts      = rc[0].reshape(-1, 3)
+        centroid = pts.mean(axis=0)
         radial   = centroid / np.linalg.norm(centroid)   # local "up" (away from Earth)
-        # Camera sits one Earth-radius above the centroid along the radial.
-        eye = centroid + radial * np.linalg.norm(centroid)
-        # "North" in the image: project global Z onto the plane perpendicular to
-        # radial; fall back to global Y if too close to a pole.
-        gz      = np.array([0.0, 0.0, 1.0])
-        cam_up  = gz - np.dot(gz, radial) * radial
+
+        # Domain half-diagonal in the tangent plane — the camera height is
+        # scaled to this so the whole domain fills the view regardless of
+        # resolution or location.
+        diff   = pts - centroid
+        tang   = diff - (diff @ radial)[:, np.newaxis] * radial  # project out radial
+        domain_radius = float(np.linalg.norm(tang, axis=1).max())
+        # 1.5× half-diagonal ≈ fits the domain with a small margin
+        height = max(domain_radius * 3.0, 1e3)   # at least 1 km above surface
+        eye    = centroid + radial * height
+
+        # "North" in the image: project global Z onto the tangent plane;
+        # fall back to global Y if too close to a pole.
+        gz     = np.array([0.0, 0.0, 1.0])
+        cam_up = gz - np.dot(gz, radial) * radial
         if np.linalg.norm(cam_up) < 1e-6:
             cam_up = np.array([0.0, 1.0, 0.0])
         cam_up /= np.linalg.norm(cam_up)
