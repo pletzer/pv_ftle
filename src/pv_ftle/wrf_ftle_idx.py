@@ -225,10 +225,10 @@ def _load_snapshot_fluxes(fname, r_corners, rotate, lats_shape, lons_shape):
         U = U * ca_u[None]
         V = V * ca_v[None]
     ds.close()
-    max_spd = max(float(np.nanmax(np.abs(U))),
-                  float(np.nanmax(np.abs(V))),
-                  float(np.nanmax(np.abs(W))))
-    return compute_face_fluxes(U, V, W, r_corners), max_spd
+    max_uvw = (float(np.nanmax(np.abs(U))),
+               float(np.nanmax(np.abs(V))),
+               float(np.nanmax(np.abs(W))))
+    return compute_face_fluxes(U, V, W, r_corners), max_uvw
 
 
 # ── time-dependent RK4 integrators ───────────────────────────────────────────
@@ -453,12 +453,12 @@ class WrfFtleIdx(FtleBase):
 
         # ── load face fluxes for each selected snapshot ───────────────────
         fluxes_list = []
-        max_spd = 0.0
+        max_uvws = []
         for i in sel_indices:
-            fluxes, spd = _load_snapshot_fluxes(
+            fluxes, uvw = _load_snapshot_fluxes(
                 all_files[i], r_corners, rotate, lats.shape, lons.shape)
             fluxes_list.append(fluxes)
-            max_spd = max(max_spd, spd)
+            max_uvws.append(uvw)
 
         t1_wall = time.perf_counter()
 
@@ -483,16 +483,28 @@ class WrfFtleIdx(FtleBase):
                   f'seed points: {len(seeds_ref)}')
 
         # ── CFL step count ─────────────────────────────────────────────────
+        # Per-direction edge lengths (5th percentile keeps outliers from
+        # over-constraining; floor at 1 m avoids division by zero)
         edge_xi  = np.linalg.norm(r_corners[:-1, :-1,  1:] - r_corners[:-1, :-1, :-1], axis=-1)
         edge_eta = np.linalg.norm(r_corners[:-1,  1:, :-1] - r_corners[:-1, :-1, :-1], axis=-1)
         edge_zta = np.linalg.norm(r_corners[ 1:, :-1, :-1] - r_corners[:-1, :-1, :-1], axis=-1)
-        h_rep = float(np.percentile(
-            np.concatenate([edge_xi.ravel(), edge_eta.ravel(), edge_zta.ravel()]), 5))
-        h_rep = max(h_rep, 1.0)
-        nsteps = max(int(max_spd * abs(self.tintegr) / h_rep / self.cfl) + 1, 20)
+        h_xi  = max(float(np.percentile(edge_xi.ravel(),  5)), 1.0)
+        h_eta = max(float(np.percentile(edge_eta.ravel(), 5)), 1.0)
+        h_zta = max(float(np.percentile(edge_zta.ravel(), 5)), 1.0)
+        # Per-component wind maxima across all loaded snapshots
+        max_U = max(uvw[0] for uvw in max_uvws)
+        max_V = max(uvw[1] for uvw in max_uvws)
+        max_W = max(uvw[2] for uvw in max_uvws)
+        # Each direction contributes independently to the step count
+        nsteps = max(
+            int(max_U * abs(self.tintegr) / h_xi  / self.cfl) + 1,
+            int(max_V * abs(self.tintegr) / h_eta / self.cfl) + 1,
+            int(max_W * abs(self.tintegr) / h_zta / self.cfl) + 1,
+            20)
         dt = self.tintegr / nsteps
         if self.verbose:
-            print(f'max_speed={max_spd:.2f} m/s  h_5pct={h_rep:.0f} m  '
+            print(f'max_U={max_U:.2f} max_V={max_V:.2f} max_W={max_W:.2f} m/s  '
+                  f'h_xi={h_xi:.0f} h_eta={h_eta:.0f} h_zta={h_zta:.0f} m  '
                   f'nsteps={nsteps}  dt={dt:.4f} s')
 
         t2_wall = time.perf_counter()
