@@ -34,9 +34,23 @@ Cartesian version.
 After integration, final reference positions are converted back to Cartesian
 via the trilinear map and FTLE is computed identically to wrf_ftle.py.
 
+Multi-file / time-dependent mode
+---------------------------------
+The positional argument is a glob pattern matching one or more WRF output files
+(e.g. 'wrf_f*.nc').  Each file is expected to hold exactly one time step.
+Files are sorted by their XTIME attribute (minutes since simulation start).
+
+--time-index selects the reference snapshot (index into the sorted file list).
+By default the velocity field is interpolated linearly between snapshots across
+the integration window so that particles see a time-varying flow.
+
+Pass --frozen to fix the velocity at the reference snapshot (faster, single
+file read).  This is equivalent to the old single-file behaviour.
+
 Cell corner numbering: identical to wrf_ftle.py (see docstring there).
 """
 
+import glob as _glob
 import math
 
 import numpy as np
@@ -47,7 +61,6 @@ import time
 
 # ── shared infrastructure ─────────────────────────────────────────────────────
 from ftle_common import (
-    integrate_rk4_ref,         # generic RK4 (replaces local version below)
     gradient_curvilinear,
     compute_ftle,
     FtleBase,
@@ -60,6 +73,13 @@ from wrf_ftle import (
     _trilinear_derivs_nb,
     _get_corners_nb,
 )
+
+# ── C++ integrator (optional — falls back to Numba if not yet compiled) ───────
+try:
+    from pv_ftle import _ftlecpp as _ftlecpp
+    _HAVE_CPP = True
+except ImportError:
+    _HAVE_CPP = False
 
 
 # ── reference-space Numba kernels ─────────────────────────────────────────────
@@ -154,34 +174,254 @@ def _ref_to_cart_nb(pos_ref, r_corners, nz, ny, nx):
     return cart
 
 
-# ── WRF-specific RK4 wrapper ──────────────────────────────────────────────────
-# integrate_rk4_ref from ftle_common is generic (takes vel_fn).
-# This helper builds the WRF closure and delegates.
+# ── multi-file helpers ────────────────────────────────────────────────────────
 
-def _wrf_integrate(seeds_ref, dt, nsteps, fluxes, r_corners, shape, verbose=False):
+def _collect_wrf_files(pattern):
+    """
+    Glob *pattern*, read XTIME from each file, sort by time.
+
+    Returns
+    -------
+    files    : list[str]          sorted file paths
+    t_sec    : np.ndarray float64  corresponding times in seconds
+    """
+    files = sorted(_glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f'No files match: {pattern!r}')
+    t_sec = []
+    for f in files:
+        ds = xr.open_dataset(f, decode_times=False)
+        # XTIME is stored in minutes since simulation start
+        xtime_min = float(np.asarray(ds['XTIME'].values).flat[0])
+        t_sec.append(xtime_min * 60.0)
+        ds.close()
+    t_sec = np.array(t_sec, dtype=np.float64)
+    order = np.argsort(t_sec)
+    return [files[i] for i in order], t_sec[order]
+
+
+def _load_snapshot_fluxes(fname, r_corners, rotate, lats_shape, lons_shape):
+    """
+    Open one WRF file, optionally rotate winds, compute face fluxes.
+
+    Returns a flux dict (keys xi_m/xi_p/et_m/et_p/zt_m/zt_p, shape (nz,ny,nx)).
+    Also returns (max_U, max_V, max_W) for CFL estimation.
+    """
+    ds = xr.open_dataset(fname)
+    U = np.nan_to_num(ds['U'][0].values.astype(np.float64), nan=0.0)
+    V = np.nan_to_num(ds['V'][0].values.astype(np.float64), nan=0.0)
+    W = np.nan_to_num(ds['W'][0].values.astype(np.float64), nan=0.0)
+    if rotate:
+        ca = ds['COSALPHA'][0].values
+        sa = ds['SINALPHA'][0].values
+        # U-stagger (ny, nx+1)
+        ca_u = np.empty((lats_shape[0], U.shape[-1]))
+        ca_u[:, 1:-1] = 0.5*(ca[:, :-1] + ca[:, 1:])
+        ca_u[:,  0] = ca[:,  0];  ca_u[:, -1] = ca[:, -1]
+        # V-stagger (ny+1, nx)
+        ca_v = np.empty((V.shape[-2], lons_shape[1]))
+        ca_v[1:-1, :] = 0.5*(ca[:-1, :] + ca[1:, :])
+        ca_v[ 0, :] = ca[ 0, :];  ca_v[-1, :] = ca[-1, :]
+        U = U * ca_u[None]
+        V = V * ca_v[None]
+    ds.close()
+    max_uvw = (float(np.nanmax(np.abs(U))),
+               float(np.nanmax(np.abs(V))),
+               float(np.nanmax(np.abs(W))))
+    return compute_face_fluxes(U, V, W, r_corners), max_uvw
+
+
+# ── time-dependent RK4 integrators ───────────────────────────────────────────
+
+def _wrf_integrate_timedep_nb(seeds_ref, t0, dt, nsteps,
+                               fluxes_list, t_snapshots,
+                               r_corners, shape,
+                               frozen=False, verbose=False):
+    """
+    Numba/Python fallback RK4 in reference space with linear time interpolation.
+    Used when the C++ extension is not available.
+    """
     nz, ny, nx = shape
-    fxm = np.ascontiguousarray(fluxes['xi_m'], dtype=np.float64)
-    fxp = np.ascontiguousarray(fluxes['xi_p'], dtype=np.float64)
-    fem = np.ascontiguousarray(fluxes['et_m'], dtype=np.float64)
-    fep = np.ascontiguousarray(fluxes['et_p'], dtype=np.float64)
-    fzm = np.ascontiguousarray(fluxes['zt_m'], dtype=np.float64)
-    fzp = np.ascontiguousarray(fluxes['zt_p'], dtype=np.float64)
-    rc  = np.ascontiguousarray(r_corners,       dtype=np.float64)
+    rc  = np.ascontiguousarray(r_corners, dtype=np.float64)
     nz_ = np.int64(nz); ny_ = np.int64(ny); nx_ = np.int64(nx)
+    ts  = np.asarray(t_snapshots, dtype=np.float64)
+    nsnap = len(fluxes_list)
 
-    def vel_fn(pos):
-        return _ref_velocity_nb(pos, fxm, fxp, fem, fep, fzm, fzp, rc,
-                                nz_, ny_, nx_)
+    farr = [
+        {k: np.ascontiguousarray(v, dtype=np.float64) for k, v in f.items()}
+        for f in fluxes_list
+    ]
 
-    return integrate_rk4_ref(seeds_ref, dt, nsteps, vel_fn, verbose=verbose)
+    def _vel_at(pos, t):
+        if frozen or nsnap == 1:
+            f = farr[0]
+        else:
+            idx = int(np.searchsorted(ts, t, side='right')) - 1
+            idx = max(0, min(idx, nsnap - 2))
+            t0s, t1s = ts[idx], ts[idx + 1]
+            alpha = float((t - t0s) / (t1s - t0s)) if t1s > t0s else 0.0
+            alpha = max(0.0, min(1.0, alpha))
+            f0, f1 = farr[idx], farr[idx + 1]
+            f = {k: (1.0 - alpha) * f0[k] + alpha * f1[k] for k in f0}
+        return _ref_velocity_nb(pos,
+                                f['xi_m'], f['xi_p'],
+                                f['et_m'], f['et_p'],
+                                f['zt_m'], f['zt_p'],
+                                rc, nz_, ny_, nx_)
+
+    pos = seeds_ref.copy()
+    t = float(t0)
+    for step in range(nsteps):
+        if verbose and step % max(1, nsteps // 10) == 0:
+            print(f'  RK4 step {step}/{nsteps}  t={t:.1f} s')
+        v1 = _vel_at(pos,               t)
+        v2 = _vel_at(pos + 0.5*dt*v1,   t + 0.5*dt)
+        v3 = _vel_at(pos + 0.5*dt*v2,   t + 0.5*dt)
+        v4 = _vel_at(pos +     dt*v3,   t +     dt)
+        pos_new = pos + (dt / 6.0) * (v1 + 2.0*v2 + 2.0*v3 + v4)
+        bad = ~np.isfinite(pos_new).all(axis=-1)
+        pos_new[bad] = pos[bad]
+        pos = pos_new
+        t += dt
+    return pos
+
+
+def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
+                            fluxes_list, t_snapshots,
+                            r_corners, shape,
+                            frozen=False, verbose=False):
+    """
+    Dispatch to C++ integrator (ftlecpp.integrate_rk4_curvilinear) when
+    available, otherwise fall back to the Numba/Python implementation.
+
+    The C++ version fuses all four RK4 k-evaluations into a single OpenMP
+    parallel loop per step, avoiding repeated fork/join overhead and keeping
+    intermediate positions in registers.
+    """
+    if _HAVE_CPP:
+        nz, ny, nx = shape
+        nt = len(fluxes_list)
+
+        # Stack per-snapshot fluxes into (nt, nz, ny, nx) float32 arrays
+        def _stack(key):
+            return np.ascontiguousarray(
+                np.stack([f[key] for f in fluxes_list], axis=0), dtype=np.float32)
+
+        fxm = _stack('xi_m'); fxp = _stack('xi_p')
+        fem = _stack('et_m'); fep = _stack('et_p')
+        fzm = _stack('zt_m'); fzp = _stack('zt_p')
+
+        # Flat seeds: [p0..pN, q0..qN, r0..rN]  (seeds are at integer corners
+        # so exact in float32; intermediate positions get float32 arithmetic)
+        N = len(seeds_ref)
+        xyz0 = np.ascontiguousarray(
+            np.concatenate([seeds_ref[:, 0],
+                            seeds_ref[:, 1],
+                            seeds_ref[:, 2]]), dtype=np.float32)
+
+        rc_f32 = np.ascontiguousarray(r_corners, dtype=np.float32)
+        t_ax   = np.asarray(t_snapshots, dtype=np.float32)
+
+        flat = _ftlecpp.integrate_rk4_curvilinear(
+            xyz0,
+            float(t0), float(dt), nsteps,
+            rc_f32,
+            fxm, fxp, fem, fep, fzm, fzp,
+            t_ax, frozen,
+        )
+
+        # Rebuild (N, 3) float64 for downstream _ref_to_cart_nb
+        return np.stack([flat[:N],
+                         flat[N:2*N],
+                         flat[2*N:]], axis=-1).astype(np.float64)
+
+    # ── Numba fallback ────────────────────────────────────────────────────
+    if verbose:
+        print('  (ftlecpp not available — using Numba fallback)')
+    return _wrf_integrate_timedep_nb(
+        seeds_ref, t0, dt, nsteps,
+        fluxes_list, t_snapshots,
+        r_corners, shape,
+        frozen=frozen, verbose=verbose,
+    )
+
+
+# ── coastline helper ──────────────────────────────────────────────────────────
+
+def add_coastlines(pl, resolution='10m', altitude=10_000.0,
+                   color='cyan', line_width=2.0, verbose=False):
+    """
+    Overlay Natural Earth coastlines on a PyVista plotter whose scene is in
+    ECEF coordinates (metres from Earth's centre).
+
+    Parameters
+    ----------
+    pl         : pyvista.Plotter
+    resolution : '10m' | '50m' | '110m'  — Natural Earth resolution
+    altitude   : float  — metres above the ellipsoid; must clear terrain
+                          (default 10 km safely above any WRF surface level)
+    color      : PyVista colour spec for the lines
+    line_width : float
+    verbose    : bool
+    """
+    import pyvista as pv
+    try:
+        import cartopy.io.shapereader as shpreader
+    except ImportError:
+        import warnings
+        warnings.warn('cartopy not found — coastlines skipped. '
+                      'Install with: pip install cartopy')
+        return
+
+    # WGS-84 parameters
+    a  = 6_378_137.0
+    b  = 6_356_752.3142
+    e2 = 1.0 - (b / a) ** 2
+
+    def _to_ecef(lon_deg, lat_deg):
+        lo = np.radians(lon_deg)
+        la = np.radians(lat_deg)
+        N  = a / np.sqrt(1.0 - e2 * np.sin(la) ** 2)
+        r  = N + altitude
+        x  = r * np.cos(la) * np.cos(lo)
+        y  = r * np.cos(la) * np.sin(lo)
+        z  = (N * (1.0 - e2) + altitude) * np.sin(la)
+        return np.stack([x, y, z], axis=-1)
+
+    shpfile = shpreader.natural_earth(resolution=resolution,
+                                      category='physical', name='coastline')
+    n_segs = 0
+    for geom in shpreader.Reader(shpfile).geometries():
+        coords = np.array(geom.coords)
+        if len(coords) < 2:
+            continue
+        pts   = _to_ecef(coords[:, 0], coords[:, 1])
+        n     = len(pts)
+        cells = np.empty(3 * (n - 1), dtype=np.int_)
+        cells[0::3] = 2
+        cells[1::3] = np.arange(n - 1)
+        cells[2::3] = np.arange(1, n)
+        seg = pv.PolyData()
+        seg.points = pts
+        seg.lines  = cells
+        pl.add_mesh(seg, color=color, line_width=line_width,
+                    render_lines_as_tubes=False)
+        n_segs += 1
+    if verbose:
+        print(f'Coastlines: {n_segs} segments added at altitude={altitude:.0f} m')
 
 
 # ── main class ────────────────────────────────────────────────────────────────
 
 class WrfFtleIdx(FtleBase):
     """
-    FTLE computation using reference-space (index-space) integration.
-    Same interface as WrfFtle; results should be numerically close.
+    FTLE computation using reference-space (index-space) integration over
+    multiple WRF output files.
+
+    wrffiles     : glob pattern matching the WRF files (e.g. 'wrf_f*.nc')
+    time_index   : index into the time-sorted file list for the reference snapshot
+    frozen       : if True, velocity is fixed at the reference snapshot
+    rotate_winds : None = auto-detect from MAP_PROJ; True/False to override
     """
 
     _EARTH_RELATIVE_PROJECTIONS = {3, 6}
@@ -189,7 +429,8 @@ class WrfFtleIdx(FtleBase):
     def __init__(self):
         super().__init__()            # tintegr, cfl, time_index, imin/imax/jmin/jmax,
                                       # checksum, cmax, verbose from FtleBase
-        self.wrffile      = ""
+        self.wrffiles     = ""
+        self.frozen       = False     # if True, fix velocity at reference snapshot
         self.rotate_winds = None      # None = auto-detect from MAP_PROJ
 
     @staticmethod
@@ -198,53 +439,76 @@ class WrfFtleIdx(FtleBase):
         return map_proj in WrfFtleIdx._EARTH_RELATIVE_PROJECTIONS
 
     def compute(self):
-        t0 = time.perf_counter()
-        ds = xr.open_dataset(self.wrffile)
-        ti = self.time_index
+        t0_wall = time.perf_counter()
 
-        # ── auto-detect wind rotation ────────────────────────────────────
+        # ── collect and sort all matching files ───────────────────────────
+        all_files, t_all_s = _collect_wrf_files(self.wrffiles)
+        nt_all = len(all_files)
+
+        if self.verbose:
+            print(f'Found {nt_all} file(s) matching {self.wrffiles!r}')
+            for fname, ts in zip(all_files, t_all_s):
+                import os
+                print(f'  {os.path.basename(fname)}  t={ts:.1f} s')
+
+        # ── reference snapshot ────────────────────────────────────────────
+        ti = self.time_index if self.time_index >= 0 else nt_all + self.time_index
+        if not (0 <= ti < nt_all):
+            raise IndexError(
+                f'time_index={self.time_index} out of range for {nt_all} file(s)')
+        t_val = t_all_s[ti]
+
+        if self.verbose:
+            import os
+            print(f'Reference snapshot: index={ti}  t={t_val:.1f} s  '
+                  f'({os.path.basename(all_files[ti])})')
+
+        # ── select files that cover the integration window ────────────────
+        if self.frozen:
+            sel_indices = [ti]
+            t_snapshots = np.array([t_val])
+            if self.verbose:
+                print('Mode: frozen (velocity fixed at reference snapshot)')
+        else:
+            if nt_all < 2:
+                raise ValueError(
+                    'Time-dependent integration requires at least 2 files; '
+                    'use --frozen instead.')
+            t_end = t_val + self.tintegr
+            tmin  = min(t_val, t_end)
+            tmax  = max(t_val, t_end)
+            in_win = np.where((t_all_s >= tmin) & (t_all_s <= tmax))[0]
+            if len(in_win) == 0:
+                raise ValueError(
+                    f'No files in time window [{tmin:.0f}, {tmax:.0f}] s.  '
+                    f'Available times: {t_all_s}')
+            # Extend by one file on each side to allow interpolation at boundary
+            i0 = max(0, int(in_win[0]) - 1)
+            i1 = min(nt_all - 1, int(in_win[-1]) + 1)
+            sel_indices = list(range(i0, i1 + 1))
+            t_snapshots = t_all_s[sel_indices]
+            if self.verbose:
+                print(f'Time window: [{tmin:.1f}, {tmax:.1f}] s  '
+                      f'loading {len(sel_indices)} snapshot(s)  '
+                      f'(t={t_snapshots[0]:.1f}–{t_snapshots[-1]:.1f} s)')
+
+        # ── grid geometry (static across files) ──────────────────────────
+        ds_ref = xr.open_dataset(all_files[ti])
+
         rotate = self.rotate_winds
         if rotate is None:
-            rotate = WrfFtleIdx.needs_rotation(ds)
+            rotate = WrfFtleIdx.needs_rotation(ds_ref)
         if self.verbose:
-            map_proj = int(ds.attrs.get('MAP_PROJ', '?'))
+            map_proj = int(ds_ref.attrs.get('MAP_PROJ', '?'))
             print(f'MAP_PROJ={map_proj}  rotate_winds={rotate}')
 
-        # ── grid ─────────────────────────────────────────────────────────
-        lats      = ds['XLAT' ][ti].values
-        lons      = ds['XLONG'][ti].values
-        ph        = ds['PH'   ][ti].values
-        phb       = ds['PHB'  ][ti].values
+        lats      = ds_ref['XLAT' ][0].values      # (ny, nx)
+        lons      = ds_ref['XLONG'][0].values
+        ph        = ds_ref['PH'   ][0].values
+        phb       = ds_ref['PHB'  ][0].values
+        ds_ref.close()
+
         heights_w = (ph + phb) / 9.81
-
-        # ── winds ─────────────────────────────────────────────────────────
-        # xarray converts _FillValue/missing_value to NaN; zero them out so
-        # degenerate cells don't corrupt face-flux computation downstream.
-        U = np.nan_to_num(ds['U'][ti].values.astype(np.float64), nan=0.0)
-        V = np.nan_to_num(ds['V'][ti].values.astype(np.float64), nan=0.0)
-        W = np.nan_to_num(ds['W'][ti].values.astype(np.float64), nan=0.0)
-
-        if rotate:
-            ca = ds['COSALPHA'][ti].values
-            sa = ds['SINALPHA'][ti].values
-            ca_u = np.empty((lats.shape[0], U.shape[-1]))
-            ca_u[:, 1:-1] = 0.5*(ca[:, :-1] + ca[:, 1:])
-            ca_u[:,  0] = ca[:,  0];  ca_u[:, -1] = ca[:, -1]
-            sa_u = np.empty_like(ca_u)
-            sa_u[:, 1:-1] = 0.5*(sa[:, :-1] + sa[:, 1:])
-            sa_u[:,  0] = sa[:,  0];  sa_u[:, -1] = sa[:, -1]
-            ca_v = np.empty((V.shape[-2], lons.shape[1]))
-            ca_v[1:-1, :] = 0.5*(ca[:-1, :] + ca[1:, :])
-            ca_v[ 0, :] = ca[ 0, :];  ca_v[-1, :] = ca[-1, :]
-            sa_v = np.empty_like(ca_v)
-            sa_v[1:-1, :] = 0.5*(sa[:-1, :] + sa[1:, :])
-            sa_v[ 0, :] = sa[ 0, :];  sa_v[-1, :] = sa[-1, :]
-            U = U * ca_u[None]
-            V = V * ca_v[None]
-
-        t1 = time.perf_counter()
-
-        # ── corner positions & face fluxes ────────────────────────────────
         r_corners = build_corner_positions(lats, lons, heights_w)
         nzp1, nyp1, nxp1 = r_corners.shape[:3]
         nz, ny, nx = nzp1-1, nyp1-1, nxp1-1
@@ -252,59 +516,76 @@ class WrfFtleIdx(FtleBase):
         if self.verbose:
             print(f'Cells: {nz}×{ny}×{nx}')
 
-        fluxes = compute_face_fluxes(U, V, W, r_corners)
+        # ── load face fluxes for each selected snapshot ───────────────────
+        fluxes_list = []
+        max_uvws = []
+        for i in sel_indices:
+            fluxes, uvw = _load_snapshot_fluxes(
+                all_files[i], r_corners, rotate, lats.shape, lons.shape)
+            fluxes_list.append(fluxes)
+            max_uvws.append(uvw)
 
-        t2 = time.perf_counter()
+        t1_wall = time.perf_counter()
 
         # ── seed sub-region ───────────────────────────────────────────────
         imin, imax, jmin, jmax = FtleBase._resolve_indices(
             self.imin, self.imax, self.jmin, self.jmax, nx, ny)
 
-        # Seed corners in reference space: corner (kp, jp, ip) → (p=ip, q=jp, r=kp)
-        ip = np.arange(imin,  imax + 2, dtype=np.float64)   # nxp1_seed = imax-imin+2
+        ip = np.arange(imin,  imax + 2, dtype=np.float64)   # nxp1_seed
         jp = np.arange(jmin,  jmax + 2, dtype=np.float64)   # nyp1_seed
         kp = np.arange(nzp1,            dtype=np.float64)   # nzp1
 
-        p_grid = ip[np.newaxis, np.newaxis, :]   # (1, 1, nxp1_seed)
-        q_grid = jp[np.newaxis, :, np.newaxis]   # (1, nyp1_seed, 1)
-        r_grid = kp[:, np.newaxis, np.newaxis]   # (nzp1, 1, 1)
-
-        # Broadcast to (nzp1, nyp1_seed, nxp1_seed, 3) then flatten
         seeds_ref = np.stack(
-            np.broadcast_arrays(p_grid, q_grid, r_grid), axis=-1
+            np.broadcast_arrays(
+                ip[np.newaxis, np.newaxis, :],
+                jp[np.newaxis, :, np.newaxis],
+                kp[:, np.newaxis, np.newaxis],
+            ), axis=-1
         ).reshape(-1, 3).astype(np.float64)
 
-        N = len(seeds_ref)
         if self.verbose:
             print(f'Seed region: i=[{imin},{imax}] j=[{jmin},{jmax}]  '
-                  f'seed points: {N}')
+                  f'seed points: {len(seeds_ref)}')
 
-        # ── CFL step count (same formula as wrf_ftle.py) ─────────────────
-        max_spd = max(float(np.nanmax(np.abs(U))),
-                      float(np.nanmax(np.abs(V))),
-                      float(np.nanmax(np.abs(W))))
+        # ── CFL step count ─────────────────────────────────────────────────
+        # Per-direction edge lengths (5th percentile keeps outliers from
+        # over-constraining; floor at 1 m avoids division by zero)
         edge_xi  = np.linalg.norm(r_corners[:-1, :-1,  1:] - r_corners[:-1, :-1, :-1], axis=-1)
         edge_eta = np.linalg.norm(r_corners[:-1,  1:, :-1] - r_corners[:-1, :-1, :-1], axis=-1)
         edge_zta = np.linalg.norm(r_corners[ 1:, :-1, :-1] - r_corners[:-1, :-1, :-1], axis=-1)
-        h_rep = float(np.percentile(
-            np.concatenate([edge_xi.ravel(), edge_eta.ravel(), edge_zta.ravel()]), 5))
-        h_rep = max(h_rep, 1.0)
-        nsteps = max(int(max_spd * abs(self.tintegr) / h_rep / self.cfl) + 1, 20)
+        h_xi  = max(float(np.percentile(edge_xi.ravel(),  5)), 1.0)
+        h_eta = max(float(np.percentile(edge_eta.ravel(), 5)), 1.0)
+        h_zta = max(float(np.percentile(edge_zta.ravel(), 5)), 1.0)
+        # Per-component wind maxima across all loaded snapshots
+        max_U = max(uvw[0] for uvw in max_uvws)
+        max_V = max(uvw[1] for uvw in max_uvws)
+        max_W = max(uvw[2] for uvw in max_uvws)
+        # Each direction contributes independently to the step count
+        nsteps = max(
+            int(max_U * abs(self.tintegr) / h_xi  / self.cfl) + 1,
+            int(max_V * abs(self.tintegr) / h_eta / self.cfl) + 1,
+            int(max_W * abs(self.tintegr) / h_zta / self.cfl) + 1,
+            20)
         dt = self.tintegr / nsteps
         if self.verbose:
-            print(f'max_speed={max_spd:.2f} m/s  h_5pct={h_rep:.0f} m  '
+            print(f'max_U={max_U:.2f} max_V={max_V:.2f} max_W={max_W:.2f} m/s  '
+                  f'h_xi={h_xi:.0f} h_eta={h_eta:.0f} h_zta={h_zta:.0f} m  '
                   f'nsteps={nsteps}  dt={dt:.4f} s')
 
-        t3 = time.perf_counter()
+        t2_wall = time.perf_counter()
 
-        # ── integrate in reference space ──────────────────────────────────
-        final_ref = _wrf_integrate(seeds_ref, dt, nsteps, fluxes,
-                                    r_corners, shape, verbose=self.verbose)
+        # ── RK4 integration in reference space ───────────────────────────
+        final_ref = _wrf_integrate_timedep(
+            seeds_ref, t_val, dt, nsteps,
+            fluxes_list, t_snapshots,
+            r_corners, shape,
+            frozen=self.frozen,
+            verbose=self.verbose,
+        )
 
-        t4 = time.perf_counter()
+        t3_wall = time.perf_counter()
 
         # ── convert final reference → Cartesian, then FTLE ───────────────
-        nzp1s = nzp1
         nyp1s = jmax - jmin + 2
         nxp1s = imax - imin + 2
         rc_seed = r_corners[:, jmin:jmax+2, imin:imax+2, :]
@@ -313,16 +594,16 @@ class WrfFtleIdx(FtleBase):
             np.ascontiguousarray(final_ref, dtype=np.float64),
             np.ascontiguousarray(r_corners, dtype=np.float64),
             np.int64(nz), np.int64(ny), np.int64(nx),
-        ).reshape(nzp1s, nyp1s, nxp1s, 3)
+        ).reshape(nzp1, nyp1s, nxp1s, 3)
 
         F    = gradient_curvilinear(Xf, rc_seed)
         ftle = compute_ftle(F, self.tintegr)
 
-        t5 = time.perf_counter()
+        t4_wall = time.perf_counter()
 
         if self.verbose:
-            print(f'Read {t1-t0:.2f}s  Build {t2-t1:.2f}s  '
-                  f'Setup {t3-t2:.2f}s  RK4 {t4-t3:.2f}s  FTLE {t5-t4:.2f}s')
+            print(f'Load {t1_wall-t0_wall:.2f}s  Setup {t2_wall-t1_wall:.2f}s  '
+                  f'RK4 {t3_wall-t2_wall:.2f}s  FTLE {t4_wall-t3_wall:.2f}s')
 
         result = dict(r_corners=rc_seed, ftle=ftle)
 
@@ -331,21 +612,95 @@ class WrfFtleIdx(FtleBase):
 
         return result
 
-    # visualise() and _print_checksum() inherited from FtleBase.
-    # Override title_prefix for the WRF label:
+    # _print_checksum() inherited from FtleBase.
     def visualise(self, result, level=0, cmax=None):
-        super().visualise(result, level=level, cmax=cmax,
-                          title_prefix='WRF FTLE (idx)')
+        """
+        Interactive level viewer with a top-down (nadir) camera.
+
+        WRF corners are in Earth-centred Cartesian (ECEF) coordinates, so the
+        correct "looking down" direction is the local radial unit vector at the
+        domain centroid — not the global Z axis used by PyVista's view_xy().
+
+        Press 'z' / 'Z' to step down / up through vertical levels.
+        """
+        import pyvista as pv
+
+        rc   = result['r_corners']   # (nzp1, nyp1, nxp1, 3)
+        ftle = result['ftle']        # (nz,   ny,   nx)
+        nzp1, nyp1, nxp1 = rc.shape[:3]
+        nz = nzp1 - 1
+        clim = [0.0, float(cmax)] if cmax is not None else None
+
+        def make_grid(k):
+            g = pv.StructuredGrid()
+            g.dimensions = (nxp1, nyp1, 1)
+            g.points = np.ascontiguousarray(rc[k].reshape(-1, 3))
+            g.cell_data['FTLE (s⁻¹)'] = ftle[k].ravel(order='C')
+            return g
+
+        state = {'k': int(level) % nz}
+        pl = pv.Plotter()
+
+        def refresh():
+            k = state['k']
+            pl.add_mesh(make_grid(k), name='ftle_surface', scalars='FTLE (s⁻¹)',
+                        cmap='hot_r', clim=clim,
+                        scalar_bar_args={'title': 'FTLE (s⁻¹)'})
+            pl.add_text(f'WRF FTLE (idx) – level {k} of {nz}  [z/Z = down/up]',
+                        font_size=12, name='level_text')
+            pl.render()
+
+        def step_down():
+            state['k'] = (state['k'] - 1) % nz
+            refresh()
+
+        def step_up():
+            state['k'] = (state['k'] + 1) % nz
+            refresh()
+
+        pl.add_key_event('z', step_down)
+        pl.add_key_event('Z', step_up)
+        refresh()
+
+        # ── nadir camera: look straight down at the domain ────────────────
+        # Centroid of the bottom seed level gives the domain centre in ECEF.
+        pts      = rc[0].reshape(-1, 3)
+        centroid = pts.mean(axis=0)
+        radial   = centroid / np.linalg.norm(centroid)   # local "up" (away from Earth)
+
+        # Domain half-diagonal in the tangent plane — the camera height is
+        # scaled to this so the whole domain fills the view regardless of
+        # resolution or location.
+        diff   = pts - centroid
+        tang   = diff - (diff @ radial)[:, np.newaxis] * radial  # project out radial
+        domain_radius = float(np.linalg.norm(tang, axis=1).max())
+        # 1.5× half-diagonal ≈ fits the domain with a small margin
+        height = max(domain_radius * 3.0, 1e3)   # at least 1 km above surface
+        eye    = centroid + radial * height
+
+        # "North" in the image: project global Z onto the tangent plane;
+        # fall back to global Y if too close to a pole.
+        gz     = np.array([0.0, 0.0, 1.0])
+        cam_up = gz - np.dot(gz, radial) * radial
+        if np.linalg.norm(cam_up) < 1e-6:
+            cam_up = np.array([0.0, 1.0, 0.0])
+        cam_up /= np.linalg.norm(cam_up)
+        pl.camera.position    = eye.tolist()
+        pl.camera.focal_point = centroid.tolist()
+        pl.camera.up          = cam_up.tolist()
+
+        add_coastlines(pl, verbose=self.verbose)
+        pl.show()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def main(*, wrffile, vtkout='wrf_ftle_idx.vts', tintegr=-3600.0, cfl=0.25,
+def main(*, wrffiles, vtkout='wrf_ftle_idx.vts', tintegr=-3600.0, cfl=0.25,
          time_index=0, rotate_winds=None, imin=None, imax=None, jmin=None,
          jmax=None, checksum=False, visualise=False, level=0, cmax=None,
-         verbose=False):
+         frozen=False, verbose=False):
     wf = WrfFtleIdx()
-    wf.wrffile       = wrffile
+    wf.wrffiles      = wrffiles
     wf.tintegr       = tintegr
     wf.cfl           = cfl
     wf.time_index    = time_index
@@ -356,6 +711,7 @@ def main(*, wrffile, vtkout='wrf_ftle_idx.vts', tintegr=-3600.0, cfl=0.25,
     wf.jmax          = jmax
     wf.checksum      = checksum
     wf.cmax          = cmax
+    wf.frozen        = frozen
     wf.verbose       = verbose
 
     result = wf.compute()
@@ -378,17 +734,31 @@ def main(*, wrffile, vtkout='wrf_ftle_idx.vts', tintegr=-3600.0, cfl=0.25,
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description='WRF FTLE – reference-space (index) integration.')
-    p.add_argument('wrffile')
-    # WRF-specific flag
+        description='WRF FTLE – reference-space (index) integration, '
+                    'multi-file time-dependent velocity.')
+    p.add_argument('wrffiles',
+                   help='Glob pattern for WRF output files (e.g. "wrf_f*.nc"). '
+                        'Files are sorted by XTIME; --time-index selects the '
+                        'reference snapshot.')
+    # WRF-specific: wind rotation
     grp = p.add_mutually_exclusive_group()
     grp.add_argument('--rotate-winds',    dest='rotate_winds',
-                     action='store_true',  default=None)
+                     action='store_true',  default=None,
+                     help='Force wind rotation (Earth-relative → grid-relative).')
     grp.add_argument('--no-rotate-winds', dest='rotate_winds',
-                     action='store_false')
+                     action='store_false',
+                     help='Force no wind rotation.')
     p.set_defaults(rotate_winds=None)
-    # shared flags (vtkout, tintegr, cfl, time-index, imin/imax/jmin/jmax,
-    #               checksum, visualise, level, cmax, verbose)
+    # frozen / time-dependent
+    grp2 = p.add_mutually_exclusive_group()
+    grp2.add_argument('--frozen', dest='frozen', action='store_true',
+                      help='Fix velocity at the reference snapshot (faster, '
+                           'single file read).')
+    grp2.add_argument('--no-frozen', dest='frozen', action='store_false',
+                      help='Interpolate velocity in time across the integration '
+                           'window (default).')
+    p.set_defaults(frozen=False)
+    # shared flags
     FtleBase.add_common_args(p, default_vtkout='wrf_ftle_idx.vts',
                                 default_tintegr=-3600.0)
     return p
@@ -396,12 +766,20 @@ def build_parser():
 
 def cli():
     args = build_parser().parse_args()
-    main(wrffile=args.wrffile, vtkout=args.vtkout, tintegr=args.tintegr,
-         cfl=args.cfl, time_index=args.time_index,
+    main(wrffiles=args.wrffiles,
+         vtkout=args.vtkout,
+         tintegr=args.tintegr,
+         cfl=args.cfl,
+         time_index=args.time_index,
          rotate_winds=args.rotate_winds,
-         imin=args.imin, imax=args.imax, jmin=args.jmin, jmax=args.jmax,
-         checksum=args.checksum, visualise=args.visualise,
-         level=args.level, cmax=args.cmax, verbose=args.verbose)
+         imin=args.imin, imax=args.imax,
+         jmin=args.jmin, jmax=args.jmax,
+         checksum=args.checksum,
+         visualise=args.visualise,
+         level=args.level,
+         cmax=args.cmax,
+         frozen=args.frozen,
+         verbose=args.verbose)
 
 
 if __name__ == '__main__':
