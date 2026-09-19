@@ -1,0 +1,17 @@
+Fix 1: invalid (fill-value) field handling
+  target  50.0 m  before: idx=11 z= 50.00 m  after: idx=11 z= 50.00 m   max|d|= 0.1000  mean|d|= 0.0004  rms= 0.0013  maxFTLE_before= 0.3953  maxFTLE_after= 0.3950
+  target  20.0 m  before: idx= 3 z= 18.00 m  after: idx= 3 z= 18.00 m   max|d|= 0.3134  mean|d|= 0.0012  rms= 0.0059  maxFTLE_before= 0.3929  maxFTLE_after= 0.3911
+  target  10.0 m  before: idx= 1 z= 10.00 m  after: idx= 1 z= 10.00 m   max|d|= 0.3861  mean|d|= 0.0352  rms= 0.0705  maxFTLE_before= 0.3991  maxFTLE_after= 0.3989
+  target   6.0 m  before: idx= 0 z=  6.00 m  after: idx= 0 z=  6.00 m   max|d|= 0.4588  mean|d|= 0.0582  rms= 0.1105  maxFTLE_before= 0.4588  maxFTLE_after= 0.4033
+
+Fix 2: u/v/w vertical-level placement
+  target  50.0 m  before: idx=10 z= 50.00 m  after: idx=11 z= 50.00 m   max|d|= 0.2866  mean|d|= 0.0288  rms= 0.0420  maxFTLE_before= 0.3859  maxFTLE_after= 0.3950
+  target  20.0 m  before: idx= 2 z= 18.00 m  after: idx= 3 z= 18.00 m   max|d|= 0.2919  mean|d|= 0.0497  rms= 0.0653  maxFTLE_before= 0.4048  maxFTLE_after= 0.3911
+  target  10.0 m  before: idx= 0 z= 10.00 m  after: idx= 1 z= 10.00 m   max|d|= 1.1971  mean|d|= 0.0528  rms= 0.0733  maxFTLE_before= 1.4644  maxFTLE_after= 0.3989
+  target   6.0 m  before: idx= 0 z= 10.00 m  after: idx= 0 z=  6.00 m   max|d|= 1.4496  mean|d|= 0.0358  rms= 0.0644  maxFTLE_before= 1.4644  maxFTLE_after= 0.4033
+
+Fix 1 + Fix 2 combined (original code vs current dev)
+  target  50.0 m  before: idx=10 z= 50.00 m  after: idx=11 z= 50.00 m   max|d|= 0.2869  mean|d|= 0.0288  rms= 0.0420  maxFTLE_before= 0.3948  maxFTLE_after= 0.3950
+  target  20.0 m  before: idx= 2 z= 18.00 m  after: idx= 3 z= 18.00 m   max|d|= 0.4075  mean|d|= 0.0496  rms= 0.0651  maxFTLE_before= 0.4059  maxFTLE_after= 0.3911
+  target  10.0 m  before: idx= 0 z= 10.00 m  after: idx= 1 z= 10.00 m   max|d|= 0.6996  mean|d|= 0.0568  rms= 0.0775  maxFTLE_before= 0.5234  maxFTLE_after= 0.3989
+  target   6.0 m  before: idx= 0 z= 10.00 m  after: idx= 0 z=  6.00 m   max|d|= 0.6537  mean|d|= 0.0427  rms= 0.0684  maxFTLE_before= 0.5234  maxFTLE_after= 0.4033
