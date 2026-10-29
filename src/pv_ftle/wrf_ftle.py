@@ -973,10 +973,10 @@ def build_parser():
         description='Compute FTLE from WRF output using mimetic velocity reconstruction.')
     p.add_argument('wrffile')
     p.add_argument('--vtkout',        default='wrf_ftle.vts')
-    p.add_argument('--tintegr',       type=float, default=-10.0,
+    p.add_argument('--tintegr',       type=float, default=-3600.0,
                    help='Integration time in seconds (negative=backward)')
-    p.add_argument('--cfl',           type=float, default=0.25)
-    p.add_argument('--time-index',    type=int,   default=0)
+    p.add_argument('--cfl',           type=float, default=0.25, help='CFL number for RK4 step count (default: 0.25)')
+    p.add_argument('--time-index',    type=int,   default=0, help='Time index in WRF file (default: 0)')
     grp = p.add_mutually_exclusive_group()
     grp.add_argument('--rotate-winds',    dest='rotate_winds', action='store_true',  default=None,
                      help='Force wind rotation (Earth-relative → grid-relative)')
