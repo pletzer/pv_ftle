@@ -406,12 +406,16 @@ def compute_face_fluxes(U, V, W, r_corners):
     For ξ- and η-faces U and V are already the normal components (grid-relative),
     so φ = velocity × |face area| is exact for orthogonal grids.
 
-    For ζ-faces W is the geometric (radial) velocity, NOT the component normal to
-    the terrain-following η-surfaces.  The correct flux is:
-        φ_ζ = W · (ê_up · A_ζ_vec)
-    where ê_up is the local radial unit vector and A_ζ_vec the face area vector.
-    Over flat terrain ê_up ∥ A_ζ_vec and this reduces to W × |A_ζ|; over sloped
-    terrain (orography) the projection removes the error from face tilt.
+    ζ-faces follow the terrain and are tilted over orography, so the horizontal
+    wind crosses them as well as W.  The flux is the full velocity dotted with
+    the face area vector:
+        φ_ζ = (U ê_i + V ê_j + W ê_up) · A_ζ_vec
+    where ê_up is the local radial unit vector, ê_i / ê_j the horizontal unit
+    vectors along the grid i / j directions, and U, V are interpolated to the
+    face centre (mass column, W-level).  Over flat terrain A_ζ_vec ∥ ê_up and
+    this reduces to W × |A_ζ|; over slopes the U, V terms cancel the W = u·∇h
+    of terrain-following flow.  The bottom face is the ground, which is
+    impermeable, so its flux is set to zero.
 
     Returns dict with keys xi_m, xi_p, et_m, et_p, zt_m, zt_p,
     each shape (nz, ny, nx).  Units: m³/s.
@@ -438,9 +442,9 @@ def compute_face_fluxes(U, V, W, r_corners):
     flux_et_m = et_flux[:, :-1, :]   # (nz, ny, nx)
     flux_et_p = et_flux[:,  1:, :]
 
-    # ζ-faces: constant k planes, corners span (i, i+1) × (j, j+1)
-    # W is the geometric vertical (dz/dt), so project onto the face area VECTOR
-    # via the local up direction, not the full face area magnitude.
+    # ζ-faces: constant k surfaces, corners span (i, i+1) × (j, j+1)
+    # Terrain-following, hence tilted: project the full velocity (U, V, W)
+    # onto the face area VECTOR.
     zt_A = rc[:, :-1, :-1]   # (nz+1, ny, nx, 3)
     zt_B = rc[:, :-1,  1:]
     zt_C = rc[:,  1:,  1:]
@@ -451,10 +455,32 @@ def compute_face_fluxes(U, V, W, r_corners):
     r_face_centre = 0.25 * (zt_A + zt_B + zt_C + zt_D)   # (nz+1, ny, nx, 3)
     up = _local_up(r_face_centre)                          # (nz+1, ny, nx, 3)
 
-    # Projected area: scalar ê_up · A_vec  (nz+1, ny, nx)
-    zt_proj = np.einsum('...i,...i->...', up, zt_avec)
+    def _dot(a, b):
+        return np.einsum('...i,...i->...', a, b)
 
-    zt_flux  = W * zt_proj
+    # Horizontal unit vectors along the grid i and j directions: the face's
+    # mean edge vectors with the vertical (slope) component removed.
+    def _horizontal_unit(t):
+        t = t - _dot(t, up)[..., None] * up
+        return t / np.linalg.norm(t, axis=-1, keepdims=True)
+    e_i = _horizontal_unit(0.5 * ((zt_B - zt_A) + (zt_C - zt_D)))
+    e_j = _horizontal_unit(0.5 * ((zt_D - zt_A) + (zt_C - zt_B)))
+
+    # U, V at face centres: average to mass columns, then interpolate linearly
+    # in height from the half levels to the W-levels (extrapolate at the top).
+    U_m = 0.5 * (U[:, :, :-1] + U[:, :, 1:])   # (nz, ny, nx)
+    V_m = 0.5 * (V[:, :-1, :] + V[:, 1:, :])
+    dz  = np.diff(np.linalg.norm(r_face_centre, axis=-1), axis=0)   # layer thickness
+    w_below = dz[1:] / (dz[:-1] + dz[1:])      # weight of the half level below
+    U_w = np.zeros_like(W);  V_w = np.zeros_like(W)
+    U_w[1:-1] = w_below * U_m[:-1] + (1 - w_below) * U_m[1:]
+    V_w[1:-1] = w_below * V_m[:-1] + (1 - w_below) * V_m[1:]
+    U_w[-1] = 1.5 * U_m[-1] - 0.5 * U_m[-2]
+    V_w[-1] = 1.5 * V_m[-1] - 0.5 * V_m[-2]
+
+    vel = U_w[..., None] * e_i + V_w[..., None] * e_j + W[..., None] * up
+    zt_flux = _dot(vel, zt_avec)               # (nz+1, ny, nx)
+    zt_flux[0] = 0.0                           # impermeable ground
     flux_zt_m = zt_flux[:-1, :, :]   # (nz, ny, nx)
     flux_zt_p = zt_flux[ 1:, :, :]
 
