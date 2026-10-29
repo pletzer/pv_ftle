@@ -75,19 +75,16 @@ def latlon_to_cart(lat_deg, lon_deg, radius):
 def _centres_to_corners_2d(field):
     """
     (ny, nx) cell-centre field → (ny+1, nx+1) corner field.
-    Interior corners: average of 4 neighbours.
-    Boundary: zero-order (nearest) extrapolation to avoid overshoot.
+    The field is padded with one ring of ghost centres obtained by linear
+    extrapolation (g = 2·f_edge − f_inner, i.e. odd reflection), then every
+    corner is the average of its 4 surrounding (real or ghost) centres.
+    Linear fields are reproduced exactly, including at the boundary, so the
+    outer row/column of cells keeps its full width.
     """
-    c = np.empty((field.shape[0] + 1, field.shape[1] + 1))
-    c[1:-1, 1:-1] = 0.25 * (field[:-1, :-1] + field[:-1, 1:]
-                           + field[1:,  :-1] + field[1:,  1:])
-    c[0,  1:-1] = c[1,  1:-1]
-    c[-1, 1:-1] = c[-2, 1:-1]
-    c[1:-1,  0] = c[1:-1,  1]
-    c[1:-1, -1] = c[1:-1, -2]
-    c[0,   0] = c[1,   1];  c[0,  -1] = c[1,  -2]
-    c[-1,  0] = c[-2,  1];  c[-1, -1] = c[-2, -2]
-    return c
+    # float64: WRF fields are float32, too coarse for Earth-centred positions
+    f = np.pad(np.asarray(field, dtype=np.float64), 1,
+               mode='reflect', reflect_type='odd')             # (ny+2, nx+2)
+    return 0.25 * (f[:-1, :-1] + f[:-1, 1:] + f[1:, :-1] + f[1:, 1:])
 
 
 def _build_horizontal_corners(lats, lons):
@@ -973,10 +970,10 @@ def build_parser():
         description='Compute FTLE from WRF output using mimetic velocity reconstruction.')
     p.add_argument('wrffile')
     p.add_argument('--vtkout',        default='wrf_ftle.vts')
-    p.add_argument('--tintegr',       type=float, default=-10.0,
+    p.add_argument('--tintegr',       type=float, default=-3600.0,
                    help='Integration time in seconds (negative=backward)')
-    p.add_argument('--cfl',           type=float, default=0.25)
-    p.add_argument('--time-index',    type=int,   default=0)
+    p.add_argument('--cfl',           type=float, default=0.25, help='CFL number for RK4 step count (default: 0.25)')
+    p.add_argument('--time-index',    type=int,   default=0, help='Time index in WRF file (default: 0)')
     grp = p.add_mutually_exclusive_group()
     grp.add_argument('--rotate-winds',    dest='rotate_winds', action='store_true',  default=None,
                      help='Force wind rotation (Earth-relative → grid-relative)')
