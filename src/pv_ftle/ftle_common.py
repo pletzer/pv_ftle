@@ -95,9 +95,23 @@ def compute_ftle(F, tintegr):
     Returns (nz, ny, nx).
     """
     C = np.einsum('...ki,...kj->...ij', F, F)    # C = F^T F
-    lam = np.linalg.eigvalsh(C.reshape(-1, 3, 3))[:, -1]
+    Cr = C.reshape(-1, 3, 3)
+    # Guard against NaN/Inf in C (e.g. particles that left the domain),
+    # which cause eigvalsh to raise LinAlgError: Eigenvalues did not converge.
+    finite_mask = np.all(np.isfinite(Cr.reshape(-1, 9)), axis=1)
+    n_bad = np.count_nonzero(~finite_mask)
+    if n_bad:
+        import warnings
+        warnings.warn(
+            f"compute_ftle: {n_bad}/{Cr.shape[0]} points have non-finite C entries "
+            "(particles likely left the domain); FTLE set to NaN there.",
+            RuntimeWarning, stacklevel=2,
+        )
+    lam = np.full(Cr.shape[0], np.nan, dtype=np.float64)
+    if finite_mask.any():
+        lam[finite_mask] = np.linalg.eigvalsh(Cr[finite_mask])[:, -1]
     #lam = np.maximum(lam, 1.0).reshape(F.shape[:3])   # incompressible: σ_max ≥ 1 ⟹ λ_max ≥ 1, FTLE ≥ 0
-    lam = np.maximum(lam, 1e-16).reshape(F.shape[:3])
+    lam = np.where(np.isfinite(lam), np.maximum(lam, 1e-16), np.nan).reshape(F.shape[:3])
     if abs(tintegr) > 1e-12:
         return np.log(lam) / (2.0 * abs(tintegr))
     return np.zeros_like(lam)
