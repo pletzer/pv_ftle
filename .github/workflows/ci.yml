@@ -63,13 +63,6 @@ jobs:
               --vtkout="$OUT/$b.vts" --checksum --verbose
           done
 
-      - name: wrf_ftle (forced wind rotation)
-        run: |
-          wrf_ftle data/wrf_f001.nc \
-            --imin=20 --imax=40 --jmin=20 --jmax=40 \
-            --tintegr=-300 --rotate-winds \
-            --vtkout="$OUT/wrf_f001_rotate.vts" --checksum --verbose
-
       - name: Check outputs
         run: |
           python - <<'EOF'
@@ -78,7 +71,7 @@ jobs:
           import pyvista as pv
 
           files = sorted(glob.glob(os.path.join(os.environ['OUT'], '*.vt[rs]')))
-          expected = 2 + len(glob.glob('data/wrf_f*.nc')) + 1
+          expected = 2 + len(glob.glob('data/wrf_f*.nc'))
           if len(files) != expected:
               sys.exit(f'expected {expected} output files, found {len(files)}: {files}')
 

@@ -55,8 +55,7 @@ from ftle_common import (
 from wrf_ftle import (
     build_corner_positions,
     compute_face_fluxes,
-    WrfFtle,                   # for needs_rotation()
-    _trilinear_map_nb,         # Numba helpers shared with PALM
+    _trilinear_map_nb,        # Numba helpers shared with PALM
     _trilinear_derivs_nb,
     _get_corners_nb,
 )
@@ -184,31 +183,15 @@ class WrfFtleIdx(FtleBase):
     Same interface as WrfFtle; results should be numerically close.
     """
 
-    _EARTH_RELATIVE_PROJECTIONS = {3, 6}
-
     def __init__(self):
         super().__init__()            # tintegr, cfl, time_index, imin/imax/jmin/jmax,
                                       # checksum, cmax, verbose from FtleBase
         self.wrffile      = ""
-        self.rotate_winds = None      # None = auto-detect from MAP_PROJ
-
-    @staticmethod
-    def needs_rotation(ds):
-        map_proj = int(ds.attrs.get('MAP_PROJ', 1))
-        return map_proj in WrfFtleIdx._EARTH_RELATIVE_PROJECTIONS
 
     def compute(self):
         t0 = time.perf_counter()
         ds = xr.open_dataset(self.wrffile)
         ti = self.time_index
-
-        # ── auto-detect wind rotation ────────────────────────────────────
-        rotate = self.rotate_winds
-        if rotate is None:
-            rotate = WrfFtleIdx.needs_rotation(ds)
-        if self.verbose:
-            map_proj = int(ds.attrs.get('MAP_PROJ', '?'))
-            print(f'MAP_PROJ={map_proj}  rotate_winds={rotate}')
 
         # ── grid ─────────────────────────────────────────────────────────
         lats      = ds['XLAT' ][ti].values
@@ -218,29 +201,14 @@ class WrfFtleIdx(FtleBase):
         heights_w = (ph + phb) / 9.81
 
         # ── winds ─────────────────────────────────────────────────────────
+        # U is along the grid i direction and V along the grid j direction
+        # (grid-relative, for every MAP_PROJ), i.e. already normal to the
+        # ξ- and η-faces, so no rotation with COSALPHA/SINALPHA is needed.
         # xarray converts _FillValue/missing_value to NaN; zero them out so
         # degenerate cells don't corrupt face-flux computation downstream.
         U = np.nan_to_num(ds['U'][ti].values.astype(np.float64), nan=0.0)
         V = np.nan_to_num(ds['V'][ti].values.astype(np.float64), nan=0.0)
         W = np.nan_to_num(ds['W'][ti].values.astype(np.float64), nan=0.0)
-
-        if rotate:
-            ca = ds['COSALPHA'][ti].values
-            sa = ds['SINALPHA'][ti].values
-            ca_u = np.empty((lats.shape[0], U.shape[-1]))
-            ca_u[:, 1:-1] = 0.5*(ca[:, :-1] + ca[:, 1:])
-            ca_u[:,  0] = ca[:,  0];  ca_u[:, -1] = ca[:, -1]
-            sa_u = np.empty_like(ca_u)
-            sa_u[:, 1:-1] = 0.5*(sa[:, :-1] + sa[:, 1:])
-            sa_u[:,  0] = sa[:,  0];  sa_u[:, -1] = sa[:, -1]
-            ca_v = np.empty((V.shape[-2], lons.shape[1]))
-            ca_v[1:-1, :] = 0.5*(ca[:-1, :] + ca[1:, :])
-            ca_v[ 0, :] = ca[ 0, :];  ca_v[-1, :] = ca[-1, :]
-            sa_v = np.empty_like(ca_v)
-            sa_v[1:-1, :] = 0.5*(sa[:-1, :] + sa[1:, :])
-            sa_v[ 0, :] = sa[ 0, :];  sa_v[-1, :] = sa[-1, :]
-            U = U * ca_u[None]
-            V = V * ca_v[None]
 
         t1 = time.perf_counter()
 
@@ -341,7 +309,7 @@ class WrfFtleIdx(FtleBase):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main(*, wrffile, vtkout='wrf_ftle_idx.vts', tintegr=-3600.0, cfl=0.25,
-         time_index=0, rotate_winds=None, imin=None, imax=None, jmin=None,
+         time_index=0, imin=None, imax=None, jmin=None,
          jmax=None, checksum=False, visualise=False, level=0, cmax=None,
          verbose=False):
     wf = WrfFtleIdx()
@@ -349,7 +317,6 @@ def main(*, wrffile, vtkout='wrf_ftle_idx.vts', tintegr=-3600.0, cfl=0.25,
     wf.tintegr       = tintegr
     wf.cfl           = cfl
     wf.time_index    = time_index
-    wf.rotate_winds  = rotate_winds
     wf.imin          = imin
     wf.imax          = imax
     wf.jmin          = jmin
@@ -380,13 +347,6 @@ def build_parser():
     p = argparse.ArgumentParser(
         description='WRF FTLE – reference-space (index) integration.')
     p.add_argument('wrffile')
-    # WRF-specific flag
-    grp = p.add_mutually_exclusive_group()
-    grp.add_argument('--rotate-winds',    dest='rotate_winds',
-                     action='store_true',  default=None)
-    grp.add_argument('--no-rotate-winds', dest='rotate_winds',
-                     action='store_false')
-    p.set_defaults(rotate_winds=None)
     # shared flags (vtkout, tintegr, cfl, time-index, imin/imax/jmin/jmax,
     #               checksum, visualise, level, cmax, verbose)
     FtleBase.add_common_args(p, default_vtkout='wrf_ftle_idx.vts',
@@ -398,7 +358,6 @@ def cli():
     args = build_parser().parse_args()
     main(wrffile=args.wrffile, vtkout=args.vtkout, tintegr=args.tintegr,
          cfl=args.cfl, time_index=args.time_index,
-         rotate_winds=args.rotate_winds,
          imin=args.imin, imax=args.imax, jmin=args.jmin, jmax=args.jmax,
          checksum=args.checksum, visualise=args.visualise,
          level=args.level, cmax=args.cmax, verbose=args.verbose)
