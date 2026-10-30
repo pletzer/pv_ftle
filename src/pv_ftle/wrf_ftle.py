@@ -24,27 +24,15 @@ where w_f is the Whitney-like weight (e.g. (1-ξ) for the ξ=0 face),
 ∂r/∂s_f is the corresponding partial derivative of the trilinear map, and
 J = ∂r/∂ξ · (∂r/∂η × ∂r/∂ζ) is the Jacobian.
 
-Wind rotation notes
--------------------
-For face-flux computation we need the component *normal to each face*, which is
-the grid-relative component.  WRF stores U/V in grid-relative coordinates for
-rotated projections (Lambert Conformal MAP_PROJ=1, Polar Stereographic MAP_PROJ=2),
-so *no rotation is needed* for those cases — U is already the ξ-normal velocity
-and V the η-normal velocity.
-
-For non-rotated projections (Mercator MAP_PROJ=3, Lat/Lon MAP_PROJ=6) U and V
-are Earth-relative (geographic east/north), and must be rotated to grid-relative
-before computing face fluxes.
-
-By default (rotate_winds=None) the correct choice is inferred automatically from
-the MAP_PROJ global attribute in the WRF file.  Pass rotate_winds=True/False to
-override.
-
-MAP_PROJ values:
-  1 – Lambert Conformal      grid-relative  → rotate_winds = False
-  2 – Polar Stereographic    grid-relative  → rotate_winds = False
-  3 – Mercator               Earth-relative → rotate_winds = True
-  6 – Lat/Lon                Earth-relative → rotate_winds = True
+Wind components
+---------------
+WRF stores U and V grid-relative for every map projection: U is the horizontal
+wind component along the grid i (west_east) direction, V along the grid j
+(south_north) direction.  WRF projections are conformal, so these directions are
+orthogonal and U, V are exactly the components normal to the constant-i and
+constant-j cell faces.  The face fluxes therefore use U and V as stored, and no
+rotation with COSALPHA/SINALPHA is needed.  (Those fields only serve to convert
+grid-relative winds to Earth-relative east/north components, e.g. for plotting.)
 """
 
 import math
@@ -418,12 +406,16 @@ def compute_face_fluxes(U, V, W, r_corners):
     For ξ- and η-faces U and V are already the normal components (grid-relative),
     so φ = velocity × |face area| is exact for orthogonal grids.
 
-    For ζ-faces W is the geometric (radial) velocity, NOT the component normal to
-    the terrain-following η-surfaces.  The correct flux is:
-        φ_ζ = W · (ê_up · A_ζ_vec)
-    where ê_up is the local radial unit vector and A_ζ_vec the face area vector.
-    Over flat terrain ê_up ∥ A_ζ_vec and this reduces to W × |A_ζ|; over sloped
-    terrain (orography) the projection removes the error from face tilt.
+    ζ-faces follow the terrain and are tilted over orography, so the horizontal
+    wind crosses them as well as W.  The flux is the full velocity dotted with
+    the face area vector:
+        φ_ζ = (U ê_i + V ê_j + W ê_up) · A_ζ_vec
+    where ê_up is the local radial unit vector, ê_i / ê_j the horizontal unit
+    vectors along the grid i / j directions, and U, V are interpolated to the
+    face centre (mass column, W-level).  Over flat terrain A_ζ_vec ∥ ê_up and
+    this reduces to W × |A_ζ|; over slopes the U, V terms cancel the W = u·∇h
+    of terrain-following flow.  The bottom face is the ground, which is
+    impermeable, so its flux is set to zero.
 
     Returns dict with keys xi_m, xi_p, et_m, et_p, zt_m, zt_p,
     each shape (nz, ny, nx).  Units: m³/s.
@@ -450,9 +442,9 @@ def compute_face_fluxes(U, V, W, r_corners):
     flux_et_m = et_flux[:, :-1, :]   # (nz, ny, nx)
     flux_et_p = et_flux[:,  1:, :]
 
-    # ζ-faces: constant k planes, corners span (i, i+1) × (j, j+1)
-    # W is the geometric vertical (dz/dt), so project onto the face area VECTOR
-    # via the local up direction, not the full face area magnitude.
+    # ζ-faces: constant k surfaces, corners span (i, i+1) × (j, j+1)
+    # Terrain-following, hence tilted: project the full velocity (U, V, W)
+    # onto the face area VECTOR.
     zt_A = rc[:, :-1, :-1]   # (nz+1, ny, nx, 3)
     zt_B = rc[:, :-1,  1:]
     zt_C = rc[:,  1:,  1:]
@@ -463,10 +455,32 @@ def compute_face_fluxes(U, V, W, r_corners):
     r_face_centre = 0.25 * (zt_A + zt_B + zt_C + zt_D)   # (nz+1, ny, nx, 3)
     up = _local_up(r_face_centre)                          # (nz+1, ny, nx, 3)
 
-    # Projected area: scalar ê_up · A_vec  (nz+1, ny, nx)
-    zt_proj = np.einsum('...i,...i->...', up, zt_avec)
+    def _dot(a, b):
+        return np.einsum('...i,...i->...', a, b)
 
-    zt_flux  = W * zt_proj
+    # Horizontal unit vectors along the grid i and j directions: the face's
+    # mean edge vectors with the vertical (slope) component removed.
+    def _horizontal_unit(t):
+        t = t - _dot(t, up)[..., None] * up
+        return t / np.linalg.norm(t, axis=-1, keepdims=True)
+    e_i = _horizontal_unit(0.5 * ((zt_B - zt_A) + (zt_C - zt_D)))
+    e_j = _horizontal_unit(0.5 * ((zt_D - zt_A) + (zt_C - zt_B)))
+
+    # U, V at face centres: average to mass columns, then interpolate linearly
+    # in height from the half levels to the W-levels (extrapolate at the top).
+    U_m = 0.5 * (U[:, :, :-1] + U[:, :, 1:])   # (nz, ny, nx)
+    V_m = 0.5 * (V[:, :-1, :] + V[:, 1:, :])
+    dz  = np.diff(np.linalg.norm(r_face_centre, axis=-1), axis=0)   # layer thickness
+    w_below = dz[1:] / (dz[:-1] + dz[1:])      # weight of the half level below
+    U_w = np.zeros_like(W);  V_w = np.zeros_like(W)
+    U_w[1:-1] = w_below * U_m[:-1] + (1 - w_below) * U_m[1:]
+    V_w[1:-1] = w_below * V_m[:-1] + (1 - w_below) * V_m[1:]
+    U_w[-1] = 1.5 * U_m[-1] - 0.5 * U_m[-2]
+    V_w[-1] = 1.5 * V_m[-1] - 0.5 * V_m[-2]
+
+    vel = U_w[..., None] * e_i + V_w[..., None] * e_j + W[..., None] * up
+    zt_flux = _dot(vel, zt_avec)               # (nz+1, ny, nx)
+    zt_flux[0] = 0.0                           # impermeable ground
     flux_zt_m = zt_flux[:-1, :, :]   # (nz, ny, nx)
     flux_zt_p = zt_flux[ 1:, :, :]
 
@@ -701,15 +715,11 @@ def compute_ftle(F, tintegr):
 
 class WrfFtle:
 
-    # MAP_PROJ values that store winds in Earth-relative coordinates
-    _EARTH_RELATIVE_PROJECTIONS = {3, 6}
-
     def __init__(self):
         self.wrffile      = ""
         self.tintegr      = -3600.0   # seconds (negative = backward)
         self.cfl          = 0.25
         self.time_index   = 0
-        self.rotate_winds = None      # None = auto-detect from MAP_PROJ
         self.imin         = None      # seed sub-region (cell indices, None = full domain)
         self.imax         = None
         self.jmin         = None
@@ -718,28 +728,10 @@ class WrfFtle:
         self.cmax         = None      # colour scale max (min fixed at 0); None = data-driven
         self.verbose      = False
 
-    @staticmethod
-    def needs_rotation(ds):
-        """
-        Return True if U/V in this WRF file are Earth-relative and must be
-        rotated to grid-relative before computing face fluxes.
-        Reads MAP_PROJ from global attributes; defaults to False if absent.
-        """
-        map_proj = int(ds.attrs.get('MAP_PROJ', 1))
-        return map_proj in WrfFtle._EARTH_RELATIVE_PROJECTIONS
-
     def compute(self):
         t0 = time.perf_counter()
         ds = xr.open_dataset(self.wrffile)
         ti = self.time_index
-
-        # ── auto-detect wind rotation from MAP_PROJ ───────────────────────
-        rotate = self.rotate_winds
-        if rotate is None:
-            rotate = WrfFtle.needs_rotation(ds)
-        if self.verbose:
-            map_proj = int(ds.attrs.get('MAP_PROJ', '?'))
-            print(f'MAP_PROJ={map_proj}  rotate_winds={rotate}')
 
         # ── grid ─────────────────────────────────────────────────────────
         lats = ds['XLAT' ][ti].values          # (ny, nx)
@@ -749,39 +741,14 @@ class WrfFtle:
         heights_w = (ph + phb) / 9.81          # geopotential height at W-levels (m)
 
         # ── winds ─────────────────────────────────────────────────────────
+        # U is along the grid i direction and V along the grid j direction
+        # (grid-relative, for every MAP_PROJ), i.e. already normal to the
+        # ξ- and η-faces, so no rotation with COSALPHA/SINALPHA is needed.
         # xarray converts _FillValue/missing_value to NaN; zero them out so
         # degenerate cells don't corrupt face-flux computation downstream.
         U = np.nan_to_num(ds['U'][ti].values.astype(np.float64), nan=0.0)  # (nz, ny, nx+1)
         V = np.nan_to_num(ds['V'][ti].values.astype(np.float64), nan=0.0)  # (nz, ny+1, nx)
         W = np.nan_to_num(ds['W'][ti].values.astype(np.float64), nan=0.0)  # (nz+1, ny, nx)
-
-        if rotate:
-            # Rotate Earth-relative → grid-relative using COSALPHA/SINALPHA.
-            # Since U and V are on different stagger grids we interpolate the
-            # rotation angles to each stagger before applying.
-            ca = ds['COSALPHA'][ti].values     # (ny, nx)
-            sa = ds['SINALPHA'][ti].values
-
-            # U-stagger (ny, nx+1): average interior, copy edge columns
-            ca_u = np.empty((lats.shape[0], U.shape[-1]))
-            ca_u[:, 1:-1] = 0.5*(ca[:, :-1]+ca[:, 1:])
-            ca_u[:,  0] = ca[:,  0];  ca_u[:, -1] = ca[:, -1]
-            sa_u = np.empty_like(ca_u)
-            sa_u[:, 1:-1] = 0.5*(sa[:, :-1]+sa[:, 1:])
-            sa_u[:,  0] = sa[:,  0];  sa_u[:, -1] = sa[:, -1]
-
-            # V-stagger (ny+1, nx): average interior, copy edge rows
-            ca_v = np.empty((V.shape[-2], lons.shape[1]))
-            ca_v[1:-1, :] = 0.5*(ca[:-1,:]+ca[1:,:])
-            ca_v[ 0, :] = ca[ 0, :];  ca_v[-1, :] = ca[-1, :]
-            sa_v = np.empty_like(ca_v)
-            sa_v[1:-1, :] = 0.5*(sa[:-1,:]+sa[1:,:])
-            sa_v[ 0, :] = sa[ 0, :];  sa_v[-1, :] = sa[-1, :]
-
-            # Rotate level-by-level (broadcast rotation angles over nz)
-            U_r =  U * ca_u[None] + 0.0          # V not available at U-stagger
-            V_r =  V * ca_v[None]                 # approximation: cross-terms omitted
-            U, V = U_r, V_r
 
         t1 = time.perf_counter()
 
@@ -929,7 +896,7 @@ class WrfFtle:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
-         time_index=0, rotate_winds=None, imin=None, imax=None, jmin=None,
+         time_index=0, imin=None, imax=None, jmin=None,
          jmax=None, checksum=False, visualise=False, level=0, cmax=None,
          verbose=False):
     wf = WrfFtle()
@@ -937,7 +904,6 @@ def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     wf.tintegr       = tintegr
     wf.cfl           = cfl
     wf.time_index    = time_index
-    wf.rotate_winds  = rotate_winds
     wf.imin          = imin
     wf.imax          = imax
     wf.jmin          = jmin
@@ -974,12 +940,6 @@ def build_parser():
                    help='Integration time in seconds (negative=backward)')
     p.add_argument('--cfl',           type=float, default=0.25, help='CFL number for RK4 step count (default: 0.25)')
     p.add_argument('--time-index',    type=int,   default=0, help='Time index in WRF file (default: 0)')
-    grp = p.add_mutually_exclusive_group()
-    grp.add_argument('--rotate-winds',    dest='rotate_winds', action='store_true',  default=None,
-                     help='Force wind rotation (Earth-relative → grid-relative)')
-    grp.add_argument('--no-rotate-winds', dest='rotate_winds', action='store_false',
-                     help='Force no wind rotation')
-    p.set_defaults(rotate_winds=None)  # None = auto-detect from MAP_PROJ
     p.add_argument('--imin',          type=int, default=200,
                    help='First i cell index for seed region (default: 200)')
     p.add_argument('--imax',          type=int, default=220,
@@ -1005,7 +965,6 @@ def cli():
     args = build_parser().parse_args()
     main(wrffile=args.wrffile, vtkout=args.vtkout, tintegr=args.tintegr,
          cfl=args.cfl, time_index=args.time_index,
-         rotate_winds=args.rotate_winds,
          imin=args.imin, imax=args.imax, jmin=args.jmin, jmax=args.jmax,
          checksum=args.checksum, visualise=args.visualise,
          level=args.level, cmax=args.cmax, verbose=args.verbose)

@@ -68,8 +68,7 @@ from ftle_common import (
 from wrf_ftle import (
     build_corner_positions,
     compute_face_fluxes,
-    WrfFtle,                   # for needs_rotation()
-    _trilinear_map_nb,         # Numba helpers shared with PALM
+    _trilinear_map_nb,        # Numba helpers shared with PALM
     _trilinear_derivs_nb,
     _get_corners_nb,
 )
@@ -200,30 +199,22 @@ def _collect_wrf_files(pattern):
     return [files[i] for i in order], t_sec[order]
 
 
-def _load_snapshot_fluxes(fname, r_corners, rotate, lats_shape, lons_shape):
+def _load_snapshot_fluxes(fname, r_corners):
     """
-    Open one WRF file, optionally rotate winds, compute face fluxes.
+    Open one WRF file and compute face fluxes.
 
     Returns a flux dict (keys xi_m/xi_p/et_m/et_p/zt_m/zt_p, shape (nz,ny,nx)).
     Also returns (max_U, max_V, max_W) for CFL estimation.
     """
     ds = xr.open_dataset(fname)
+    # U is along the grid i direction and V along the grid j direction
+    # (grid-relative, for every MAP_PROJ), i.e. already normal to the
+    # ξ- and η-faces, so no rotation with COSALPHA/SINALPHA is needed.
+    # xarray converts _FillValue/missing_value to NaN; zero them out so
+    # degenerate cells don't corrupt face-flux computation downstream.
     U = np.nan_to_num(ds['U'][0].values.astype(np.float64), nan=0.0)
     V = np.nan_to_num(ds['V'][0].values.astype(np.float64), nan=0.0)
     W = np.nan_to_num(ds['W'][0].values.astype(np.float64), nan=0.0)
-    if rotate:
-        ca = ds['COSALPHA'][0].values
-        sa = ds['SINALPHA'][0].values
-        # U-stagger (ny, nx+1)
-        ca_u = np.empty((lats_shape[0], U.shape[-1]))
-        ca_u[:, 1:-1] = 0.5*(ca[:, :-1] + ca[:, 1:])
-        ca_u[:,  0] = ca[:,  0];  ca_u[:, -1] = ca[:, -1]
-        # V-stagger (ny+1, nx)
-        ca_v = np.empty((V.shape[-2], lons_shape[1]))
-        ca_v[1:-1, :] = 0.5*(ca[:-1, :] + ca[1:, :])
-        ca_v[ 0, :] = ca[ 0, :];  ca_v[-1, :] = ca[-1, :]
-        U = U * ca_u[None]
-        V = V * ca_v[None]
     ds.close()
     max_uvw = (float(np.nanmax(np.abs(U))),
                float(np.nanmax(np.abs(V))),
@@ -421,22 +412,13 @@ class WrfFtleIdx(FtleBase):
     wrffiles     : glob pattern matching the WRF files (e.g. 'wrf_f*.nc')
     time_index   : index into the time-sorted file list for the reference snapshot
     frozen       : if True, velocity is fixed at the reference snapshot
-    rotate_winds : None = auto-detect from MAP_PROJ; True/False to override
     """
-
-    _EARTH_RELATIVE_PROJECTIONS = {3, 6}
 
     def __init__(self):
         super().__init__()            # tintegr, cfl, time_index, imin/imax/jmin/jmax,
                                       # checksum, cmax, verbose from FtleBase
         self.wrffiles     = ""
         self.frozen       = False     # if True, fix velocity at reference snapshot
-        self.rotate_winds = None      # None = auto-detect from MAP_PROJ
-
-    @staticmethod
-    def needs_rotation(ds):
-        map_proj = int(ds.attrs.get('MAP_PROJ', 1))
-        return map_proj in WrfFtleIdx._EARTH_RELATIVE_PROJECTIONS
 
     def compute(self):
         t0_wall = time.perf_counter()
@@ -495,13 +477,6 @@ class WrfFtleIdx(FtleBase):
         # ── grid geometry (static across files) ──────────────────────────
         ds_ref = xr.open_dataset(all_files[ti])
 
-        rotate = self.rotate_winds
-        if rotate is None:
-            rotate = WrfFtleIdx.needs_rotation(ds_ref)
-        if self.verbose:
-            map_proj = int(ds_ref.attrs.get('MAP_PROJ', '?'))
-            print(f'MAP_PROJ={map_proj}  rotate_winds={rotate}')
-
         lats      = ds_ref['XLAT' ][0].values      # (ny, nx)
         lons      = ds_ref['XLONG'][0].values
         ph        = ds_ref['PH'   ][0].values
@@ -520,8 +495,7 @@ class WrfFtleIdx(FtleBase):
         fluxes_list = []
         max_uvws = []
         for i in sel_indices:
-            fluxes, uvw = _load_snapshot_fluxes(
-                all_files[i], r_corners, rotate, lats.shape, lons.shape)
+            fluxes, uvw = _load_snapshot_fluxes(all_files[i], r_corners)
             fluxes_list.append(fluxes)
             max_uvws.append(uvw)
 
@@ -696,7 +670,7 @@ class WrfFtleIdx(FtleBase):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main(*, wrffiles, vtkout='wrf_ftle_idx.vts', tintegr=-3600.0, cfl=0.25,
-         time_index=0, rotate_winds=None, imin=None, imax=None, jmin=None,
+         time_index=0, imin=None, imax=None, jmin=None,
          jmax=None, checksum=False, visualise=False, level=0, cmax=None,
          frozen=False, verbose=False):
     wf = WrfFtleIdx()
@@ -704,7 +678,6 @@ def main(*, wrffiles, vtkout='wrf_ftle_idx.vts', tintegr=-3600.0, cfl=0.25,
     wf.tintegr       = tintegr
     wf.cfl           = cfl
     wf.time_index    = time_index
-    wf.rotate_winds  = rotate_winds
     wf.imin          = imin
     wf.imax          = imax
     wf.jmin          = jmin
@@ -740,15 +713,6 @@ def build_parser():
                    help='Glob pattern for WRF output files (e.g. "wrf_f*.nc"). '
                         'Files are sorted by XTIME; --time-index selects the '
                         'reference snapshot.')
-    # WRF-specific: wind rotation
-    grp = p.add_mutually_exclusive_group()
-    grp.add_argument('--rotate-winds',    dest='rotate_winds',
-                     action='store_true',  default=None,
-                     help='Force wind rotation (Earth-relative → grid-relative).')
-    grp.add_argument('--no-rotate-winds', dest='rotate_winds',
-                     action='store_false',
-                     help='Force no wind rotation.')
-    p.set_defaults(rotate_winds=None)
     # frozen / time-dependent
     grp2 = p.add_mutually_exclusive_group()
     grp2.add_argument('--frozen', dest='frozen', action='store_true',
@@ -771,7 +735,6 @@ def cli():
          tintegr=args.tintegr,
          cfl=args.cfl,
          time_index=args.time_index,
-         rotate_winds=args.rotate_winds,
          imin=args.imin, imax=args.imax,
          jmin=args.jmin, jmax=args.jmax,
          checksum=args.checksum,
