@@ -24,6 +24,10 @@ wrf_ftle "data/wrf_f*.nc" "${WRF_SEEDS[@]}" \
 wrf_ftle data/wrf_f001.nc --frozen "${WRF_SEEDS[@]}" \
     --tintegr=-300 --vtkout="$OUT/wrf_frozen_f001.vts" --checksum --verbose
 
+# lowest-order (Raviart–Thomas) velocity reconstruction
+wrf_ftle data/wrf_f001.nc --frozen --order=1 "${WRF_SEEDS[@]}" \
+    --tintegr=-300 --vtkout="$OUT/wrf_frozen_f001_order1.vts" --checksum --verbose
+
 # Cartesian (curvilinear) cross-check, one frozen snapshot per file
 for f in data/wrf_f*.nc; do
     wrf_ftle_curvilinear "$f" "${WRF_SEEDS[@]}" \
