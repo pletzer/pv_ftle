@@ -38,61 +38,11 @@ jobs:
           # extra runtime deps of wrf_ftle not listed in setup.py
           pip install scipy xarray numba pyvista
 
-      - name: palm_ftle (backward)
-        run: |
-          mkdir -p "$OUT"
-          palm_ftle data/small_blf_day_loc1_4m_xy_N04.003.nc \
-            --imin=10 --imax=80 --jmin=10 --jmax=80 \
-            --tintegr=-5 --time-index=8 \
-            --vtkout="$OUT/palm_backward.vtr" --checksum --verbose
+      - name: Run FTLE cases
+        run: tests/run_cases.sh "$OUT"
 
-      - name: palm_ftle (forward)
-        run: |
-          palm_ftle data/small_blf_day_loc1_4m_xy_N04.003.nc \
-            --imin=10 --imax=80 --jmin=10 --jmax=80 \
-            --tintegr=5 --time-index=2 \
-            --vtkout="$OUT/palm_forward.vtr" --checksum --verbose
-
-      - name: wrf_ftle
-        run: |
-          for f in data/wrf_f*.nc; do
-            b=$(basename "$f" .nc)
-            wrf_ftle "$f" \
-              --imin=20 --imax=40 --jmin=20 --jmax=40 \
-              --tintegr=-300 \
-              --vtkout="$OUT/$b.vts" --checksum --verbose
-          done
-
-      - name: Check outputs
-        run: |
-          python - <<'EOF'
-          import glob, os, sys
-          import numpy as np
-          import pyvista as pv
-
-          files = sorted(glob.glob(os.path.join(os.environ['OUT'], '*.vt[rs]')))
-          expected = 2 + len(glob.glob('data/wrf_f*.nc'))
-          if len(files) != expected:
-              sys.exit(f'expected {expected} output files, found {len(files)}: {files}')
-
-          failed = False
-          for f in files:
-              mesh = pv.read(f)
-              names = [n for n in mesh.array_names if 'ftle' in n.lower()]
-              if not names:
-                  print(f'FAIL {f}: no FTLE array in {mesh.array_names}')
-                  failed = True
-                  continue
-              a = np.asarray(mesh[names[0]], dtype=np.float64)
-              finite = np.isfinite(a)
-              print(f'{os.path.basename(f):28s} {names[0]!r} n={a.size} '
-                    f'finite={finite.mean():.3f} min={np.nanmin(a):.4g} '
-                    f'max={np.nanmax(a):.4g} mean={np.nanmean(a):.4g}')
-              if a.size == 0 or not finite.all() or np.nanmax(np.abs(a)) == 0:
-                  print(f'FAIL {f}: empty, non-finite or all-zero FTLE')
-                  failed = True
-          sys.exit(1 if failed else 0)
-          EOF
+      - name: Compare with reference (rtol 1e-4 on FTLE min/max)
+        run: python tests/check_outputs.py "$OUT" --rtol=1e-4
 
       - uses: actions/upload-artifact@v4
         if: always()
