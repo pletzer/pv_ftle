@@ -44,7 +44,7 @@ from numba import njit, prange
 import argparse
 import time
 
-R_EARTH = 6_371_000.0  # metres
+R_EARTH = 6_370_000.0  # metres; WRF's spherical-Earth radius (EARTH_RADIUS_M)
 
 # ── coordinate helpers ────────────────────────────────────────────────────────
 
@@ -415,7 +415,8 @@ def compute_face_fluxes(U, V, W, r_corners):
     face centre (mass column, W-level).  Over flat terrain A_ζ_vec ∥ ê_up and
     this reduces to W × |A_ζ|; over slopes the U, V terms cancel the W = u·∇h
     of terrain-following flow.  The bottom face is the ground, which is
-    impermeable, so its flux is set to zero.
+    impermeable, and the top face is WRF's model lid, where the coordinate
+    vertical velocity Ω is zero; both fluxes are set to zero.
 
     Returns dict with keys xi_m, xi_p, et_m, et_p, zt_m, zt_p,
     each shape (nz, ny, nx).  Units: m³/s.
@@ -467,7 +468,7 @@ def compute_face_fluxes(U, V, W, r_corners):
     e_j = _horizontal_unit(0.5 * ((zt_D - zt_A) + (zt_C - zt_B)))
 
     # U, V at face centres: average to mass columns, then interpolate linearly
-    # in height from the half levels to the W-levels (extrapolate at the top).
+    # in height from the half levels to the interior W-levels.
     U_m = 0.5 * (U[:, :, :-1] + U[:, :, 1:])   # (nz, ny, nx)
     V_m = 0.5 * (V[:, :-1, :] + V[:, 1:, :])
     dz  = np.diff(np.linalg.norm(r_face_centre, axis=-1), axis=0)   # layer thickness
@@ -475,12 +476,11 @@ def compute_face_fluxes(U, V, W, r_corners):
     U_w = np.zeros_like(W);  V_w = np.zeros_like(W)
     U_w[1:-1] = w_below * U_m[:-1] + (1 - w_below) * U_m[1:]
     V_w[1:-1] = w_below * V_m[:-1] + (1 - w_below) * V_m[1:]
-    U_w[-1] = 1.5 * U_m[-1] - 0.5 * U_m[-2]
-    V_w[-1] = 1.5 * V_m[-1] - 0.5 * V_m[-2]
 
     vel = U_w[..., None] * e_i + V_w[..., None] * e_j + W[..., None] * up
     zt_flux = _dot(vel, zt_avec)               # (nz+1, ny, nx)
-    zt_flux[0] = 0.0                           # impermeable ground
+    zt_flux[0]  = 0.0                          # impermeable ground
+    zt_flux[-1] = 0.0                          # model lid (Ω = 0)
     flux_zt_m = zt_flux[:-1, :, :]   # (nz, ny, nx)
     flux_zt_p = zt_flux[ 1:, :, :]
 

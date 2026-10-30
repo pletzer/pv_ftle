@@ -310,13 +310,15 @@ def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
                             seeds_ref[:, 1],
                             seeds_ref[:, 2]]), dtype=np.float32)
 
-        rc_f32 = np.ascontiguousarray(r_corners, dtype=np.float32)
+        # Corners stay float64: they are Earth-centred (~6.4e6 m), where float32
+        # resolves only ~0.5 m, too coarse for the Jacobian of thin low layers.
+        rc_f64 = np.ascontiguousarray(r_corners, dtype=np.float64)
         t_ax   = np.asarray(t_snapshots, dtype=np.float32)
 
         flat = _ftlecpp.integrate_rk4_curvilinear(
             xyz0,
             float(t0), float(dt), nsteps,
-            rc_f32,
+            rc_f64,
             fxm, fxp, fem, fep, fzm, fzp,
             t_ax, frozen,
         )
@@ -459,6 +461,13 @@ class WrfFtleIdx(FtleBase):
             t_end = t_val + self.tintegr
             tmin  = min(t_val, t_end)
             tmax  = max(t_val, t_end)
+            # Outside the snapshots the time interpolation would clamp, i.e.
+            # silently freeze the flow at the first/last file.
+            if tmin < t_all_s[0] or tmax > t_all_s[-1]:
+                raise ValueError(
+                    f'Integration window [{tmin:.0f}, {tmax:.0f}] s extends beyond '
+                    f'the files [{t_all_s[0]:.0f}, {t_all_s[-1]:.0f}] s; choose '
+                    f'another --time-index/--tintegr or use --frozen.')
             in_win = np.where((t_all_s >= tmin) & (t_all_s <= tmax))[0]
             if len(in_win) == 0:
                 raise ValueError(

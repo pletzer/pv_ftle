@@ -198,22 +198,22 @@ py::array_t<float> integrate_rk4(
 //   4:(k+1,j,i) 5:(k+1,j,i+1) 6:(k+1,j+1,i+1) 7:(k+1,j+1,i)
 // -----------------------------------------------------------------------------
 static inline void get_corners_curv(
-    const float* rc, int nyp1, int nxp1,
+    const double* rc, int nyp1, int nxp1,
     int kn, int jn, int in_,
-    float corners[8][3])
+    double corners[8][3])
 {
     // Stride: rc[k, j, i, d] = rc[((k*nyp1 + j)*nxp1 + i)*3 + d]
-    auto at = [&](int k, int j, int i) -> const float* {
-        return rc + ((k * nyp1 + j) * nxp1 + i) * 3;
+    auto at = [&](int k, int j, int i) -> const double* {
+        return rc + ((size_t)(k * nyp1 + j) * nxp1 + i) * 3;
     };
-    const float* c0 = at(kn,   jn,   in_  );
-    const float* c1 = at(kn,   jn,   in_+1);
-    const float* c2 = at(kn,   jn+1, in_+1);
-    const float* c3 = at(kn,   jn+1, in_  );
-    const float* c4 = at(kn+1, jn,   in_  );
-    const float* c5 = at(kn+1, jn,   in_+1);
-    const float* c6 = at(kn+1, jn+1, in_+1);
-    const float* c7 = at(kn+1, jn+1, in_  );
+    const double* c0 = at(kn,   jn,   in_  );
+    const double* c1 = at(kn,   jn,   in_+1);
+    const double* c2 = at(kn,   jn+1, in_+1);
+    const double* c3 = at(kn,   jn+1, in_  );
+    const double* c4 = at(kn+1, jn,   in_  );
+    const double* c5 = at(kn+1, jn,   in_+1);
+    const double* c6 = at(kn+1, jn+1, in_+1);
+    const double* c7 = at(kn+1, jn+1, in_  );
     for (int d = 0; d < 3; d++) {
         corners[0][d] = c0[d]; corners[1][d] = c1[d];
         corners[2][d] = c2[d]; corners[3][d] = c3[d];
@@ -225,10 +225,12 @@ static inline void get_corners_curv(
 // -----------------------------------------------------------------------------
 // Helper: trilinear derivatives ∂r/∂ξ, ∂r/∂η, ∂r/∂ζ at barycentric (a, b, g)
 // Matches _trilinear_derivs_nb in wrf_ftle.py exactly.
+// Double precision: corners are Earth-centred (|r| ≈ 6.4e6 m), where float32
+// resolves only ~0.5 m — too coarse for the 20-50 m edges of the lowest layers.
 // -----------------------------------------------------------------------------
 static inline void trilinear_derivs_curv(
-    const float c[8][3], float a, float b, float g,
-    float dxi[3], float deta[3], float dzta[3])
+    const double c[8][3], double a, double b, double g,
+    double dxi[3], double deta[3], double dzta[3])
 {
     for (int d = 0; d < 3; d++) {
         dxi[d]  = (1-b)*(1-g)*(c[1][d]-c[0][d])
@@ -257,7 +259,7 @@ static inline void trilinear_derivs_curv(
 // -----------------------------------------------------------------------------
 static inline void ref_vel_curv(
     float p, float q, float r, float t,
-    const float* rc,
+    const double* rc,
     int nz, int ny, int nx,
     const float* fxm, const float* fxp,
     const float* fem, const float* fep,
@@ -276,23 +278,23 @@ static inline void ref_vel_curv(
     const float eta  = std::clamp(q - (float)jn,  0.0f, 1.0f);
     const float zeta = std::clamp(r - (float)kn,  0.0f, 1.0f);
 
-    // Jacobian
-    float corners[8][3];
+    // Jacobian (double, see trilinear_derivs_curv)
+    double corners[8][3];
     get_corners_curv(rc, nyp1, nxp1, kn, jn, in_, corners);
 
-    float dxi_v[3], deta_v[3], dzta_v[3];
+    double dxi_v[3], deta_v[3], dzta_v[3];
     trilinear_derivs_curv(corners, xi, eta, zeta, dxi_v, deta_v, dzta_v);
 
-    const float J =
+    const double J =
           dxi_v[0]*(deta_v[1]*dzta_v[2] - deta_v[2]*dzta_v[1])
         - dxi_v[1]*(deta_v[0]*dzta_v[2] - deta_v[2]*dzta_v[0])
         + dxi_v[2]*(deta_v[0]*dzta_v[1] - deta_v[1]*dzta_v[0]);
 
     // Scale-invariant singularity guard (degenerate terrain-following cell)
-    const float col0 = std::sqrt(dxi_v[0]*dxi_v[0] + dxi_v[1]*dxi_v[1] + dxi_v[2]*dxi_v[2]);
-    const float col1 = std::sqrt(deta_v[0]*deta_v[0] + deta_v[1]*deta_v[1] + deta_v[2]*deta_v[2]);
-    const float col2 = std::sqrt(dzta_v[0]*dzta_v[0] + dzta_v[1]*dzta_v[1] + dzta_v[2]*dzta_v[2]);
-    if (std::fabs(J) < 1e-6f * col0 * col1 * col2) {
+    const double col0 = std::sqrt(dxi_v[0]*dxi_v[0] + dxi_v[1]*dxi_v[1] + dxi_v[2]*dxi_v[2]);
+    const double col1 = std::sqrt(deta_v[0]*deta_v[0] + deta_v[1]*deta_v[1] + deta_v[2]*deta_v[2]);
+    const double col2 = std::sqrt(dzta_v[0]*dzta_v[0] + dzta_v[1]*dzta_v[1] + dzta_v[2]*dzta_v[2]);
+    if (std::fabs(J) < 1e-6 * col0 * col1 * col2) {
         vel[0] = vel[1] = vel[2] = 0.0f;
         return;
     }
@@ -325,8 +327,8 @@ static inline void ref_vel_curv(
     const float fzm_v = om*fzm[off0] + mu*fzm[off1];
     const float fzp_v = om*fzp[off0] + mu*fzp[off1];
 
-    const float inv_J = 1.0f / J;
-    vel[0] = ((1.0f - xi)   * fxm_v + xi   * fxp_v) * inv_J;
+    const float inv_J = (float)(1.0 / J);
+    vel[0] =((1.0f - xi)   * fxm_v + xi   * fxp_v) * inv_J;
     vel[1] = ((1.0f - eta)  * fem_v + eta  * fep_v) * inv_J;
     vel[2] = ((1.0f - zeta) * fzm_v + zeta * fzp_v) * inv_J;
 }
@@ -337,7 +339,7 @@ static inline void ref_vel_curv(
 // xyz0     : flat float32 (3*N,)  — [p0..pN, q0..qN, r0..rN]
 // t0, dt   : start time and step size [s]
 // nsteps   : number of RK4 steps
-// r_corners: (nzp1, nyp1, nxp1, 3)  corner Cartesian positions
+// r_corners: (nzp1, nyp1, nxp1, 3)  corner Cartesian positions (float64)
 // fxm..fzp : (nt, nz, ny, nx)  face fluxes [m³/s] — xi_m/p, et_m/p, zt_m/p
 // t_axis   : (nt,)  snapshot times [s], sorted ascending
 // frozen   : if true, always use snapshot 0 (t_axis ignored)
@@ -351,7 +353,7 @@ static inline void ref_vel_curv(
 py::array_t<float> integrate_rk4_curvilinear(
     const py::array_t<float>& xyz0,
     float t0, float dt, int nsteps,
-    const py::array_t<float>& r_corners,
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& r_corners,
     const py::array_t<float>& fxm_arr,
     const py::array_t<float>& fxp_arr,
     const py::array_t<float>& fem_arr,
@@ -373,7 +375,7 @@ py::array_t<float> integrate_rk4_curvilinear(
     const int nxp1  = (int)r_corners.shape(2);
     const int nz = nzp1-1, ny = nyp1-1, nx = nxp1-1;
 
-    const float* rc    = r_corners.data();
+    const double* rc   = r_corners.data();
     const float* fxm   = fxm_arr.data();
     const float* fxp   = fxp_arr.data();
     const float* fem   = fem_arr.data();
