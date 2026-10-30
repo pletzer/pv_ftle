@@ -35,7 +35,7 @@ jobs:
       - name: Install pv_ftle
         run: |
           pip install --no-build-isolation .
-          # extra runtime deps of wrf_ftle not listed in setup.py
+          # extra runtime deps of the WRF tools not listed in setup.py
           pip install scipy xarray numba pyvista
 
       - name: Run FTLE cases

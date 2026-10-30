@@ -42,7 +42,7 @@ setup(
         "console_scripts": [
             "palm_ftle=pv_ftle.palm_ftle:cli",
             "palm_ftle_idx=pv_ftle.palm_ftle_idx:cli",
-            "wrf_ftle_idx=pv_ftle.wrf_ftle_idx:cli",
+            "wrf_ftle_curvilinear=pv_ftle.wrf_ftle_curvilinear:cli",
             "wrf_ftle=pv_ftle.wrf_ftle:cli",
             "palm_uv_plotter=pv_ftle.palm_uv_plotter:cli",
         ]

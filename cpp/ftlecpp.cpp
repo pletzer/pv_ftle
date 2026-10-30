@@ -193,7 +193,7 @@ py::array_t<float> integrate_rk4(
 
 // -----------------------------------------------------------------------------
 // Helper: extract 8 cell corners from r_corners(nzp1, nyp1, nxp1, 3)
-// Corner numbering matches wrf_ftle_idx.py:
+// Corner numbering matches wrf_ftle.py:
 //   0:(k,j,i)  1:(k,j,i+1)  2:(k,j+1,i+1)  3:(k,j+1,i)
 //   4:(k+1,j,i) 5:(k+1,j,i+1) 6:(k+1,j+1,i+1) 7:(k+1,j+1,i)
 // -----------------------------------------------------------------------------
@@ -224,7 +224,7 @@ static inline void get_corners_curv(
 
 // -----------------------------------------------------------------------------
 // Helper: trilinear derivatives ∂r/∂ξ, ∂r/∂η, ∂r/∂ζ at barycentric (a, b, g)
-// Matches _trilinear_derivs_nb in wrf_ftle.py exactly.
+// Matches _trilinear_derivs_nb in wrf_ftle_curvilinear.py exactly.
 // Double precision: corners are Earth-centred (|r| ≈ 6.4e6 m), where float32
 // resolves only ~0.5 m — too coarse for the 20-50 m edges of the lowest layers.
 // -----------------------------------------------------------------------------

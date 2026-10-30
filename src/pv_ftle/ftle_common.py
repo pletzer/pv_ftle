@@ -7,7 +7,7 @@ PyVista visualisation (z/Z level stepping, --cmax colour locking), and
 checksum printing.
 
 Data-source-specific code (grid building, face-flux or velocity
-computation, NetCDF reading) lives in wrf_ftle_idx.py and palm_ftle_idx.py.
+computation, NetCDF reading) lives in wrf_ftle.py and palm_ftle_idx.py.
 """
 
 import numpy as np
