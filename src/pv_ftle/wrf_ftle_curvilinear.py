@@ -421,6 +421,9 @@ def compute_face_fluxes(U, V, W, r_corners):
 
     Returns dict with keys xi_m, xi_p, et_m, et_p, zt_m, zt_p,
     each shape (nz, ny, nx).  Units: m³/s.
+    Also xi, et, zt: the same fluxes on the staggered grids (nz, ny, nx+1),
+    (nz, ny+1, nx), (nz+1, ny, nx), and xi_area, et_area, zt_area: the face
+    areas (m²) on those grids.
     """
     rc = r_corners
 
@@ -487,7 +490,11 @@ def compute_face_fluxes(U, V, W, r_corners):
 
     return dict(xi_m=flux_xi_m, xi_p=flux_xi_p,
                 et_m=flux_et_m, et_p=flux_et_p,
-                zt_m=flux_zt_m, zt_p=flux_zt_p)
+                zt_m=flux_zt_m, zt_p=flux_zt_p,
+                # staggered fluxes and face areas (m²), one value per face
+                xi=xi_flux, et=et_flux, zt=zt_flux,
+                xi_area=xi_area, et_area=et_area,
+                zt_area=np.linalg.norm(zt_avec, axis=-1))
 
 
 # ── mimetic velocity reconstruction ──────────────────────────────────────────

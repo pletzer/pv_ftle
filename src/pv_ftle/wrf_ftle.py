@@ -65,6 +65,7 @@ import time
 from ftle_common import (
     gradient_curvilinear,
     compute_ftle,
+    compute_ftle_horizontal,
     FtleBase,
 )
 from wrf_ftle_curvilinear import (
@@ -85,17 +86,109 @@ except ImportError:
 
 # ── reference-space Numba kernels ─────────────────────────────────────────────
 
+@njit(cache=True)
+def _shift_nb(c0, c1, c2, ax, d):
+    """Face index (k, j, i) moved by d along axis ax (0 = k, 1 = j, 2 = i)."""
+    if ax == 0:
+        return c0 + d, c1, c2
+    if ax == 1:
+        return c0, c1 + d, c2
+    return c0, c1, c2 + d
+
+
+@njit(cache=True)
+def _face_w_nb(w0, w1, mu, c0, c1, c2):
+    """Face-mean normal velocity, linearly interpolated between two snapshots."""
+    return (1.0 - mu) * w0[c0, c1, c2] + mu * w1[c0, c1, c2]
+
+
+@njit(cache=True)
+def _face_slope_nb(w0, w1, mu, c0, c1, c2, ax):
+    """Index-space derivative of w along axis ax at face (c0, c1, c2):
+    central difference, one-sided at the grid edge, 0 for a single face."""
+    n = w0.shape[ax]
+    if n < 2:
+        return 0.0
+    c = c0 if ax == 0 else (c1 if ax == 1 else c2)
+    if c == 0:
+        h0, h1, h = 0, 1, 1.0
+    elif c == n - 1:
+        h0, h1, h = -1, 0, 1.0
+    else:
+        h0, h1, h = -1, 1, 2.0
+    a0, a1, a2 = _shift_nb(c0, c1, c2, ax, h0)
+    b0, b1, b2 = _shift_nb(c0, c1, c2, ax, h1)
+    return (_face_w_nb(w0, w1, mu, b0, b1, b2) - _face_w_nb(w0, w1, mu, a0, a1, a2)) / h
+
+
+@njit(cache=True)
+def _flux_density_nb(w0, w1, mu, area, ax, k, j, i, lz, ly, lx, order):
+    """
+    Flux density J·(d l_ax/dt) of the component normal to axis ax (0 = ζ,
+    1 = η, 2 = ξ) at local coordinates (lz, ly, lx) inside cell (k, j, i).
+
+    order 1 (lowest-order Raviart–Thomas): linear between the two faces,
+      constant on each face:  F = (1-l)·A0·w0 + l·A1·w1.
+    order 2: quadratic between the faces and linear along each face (Q₂,₁,₁):
+      on each face   A·[w + s_t1·(l_t1 - ½) + s_t2·(l_t2 - ½)],
+      across the cell + ½·Ā·c·l(l - 1),
+    where the tangential slopes s and the second derivative c of w come from
+    the neighbouring faces.  The slope terms integrate to zero over the face and
+    the quadratic term vanishes on both faces, so every face still carries
+    exactly its flux A·w.  Working with w = flux/area (not the flux itself)
+    keeps a constant wind exact on vertically stretched layers, as at order 1.
+    Must match flux_density() in cpp/ftlecpp.cpp.
+    """
+    a0i = (k, j, i)
+    b0, b1, b2 = _shift_nb(k, j, i, ax, 1)          # face at l_ax = 1
+    l = lz if ax == 0 else (ly if ax == 1 else lx)
+    A0 = area[k, j, i]
+    A1 = area[b0, b1, b2]
+    wa = _face_w_nb(w0, w1, mu, k, j, i)
+    wb = _face_w_nb(w0, w1, mu, b0, b1, b2)
+    if order < 2:
+        return (1.0 - l) * A0 * wa + l * A1 * wb
+
+    for t in range(3):                               # tangential slopes
+        if t == ax:
+            continue
+        dl = (lz if t == 0 else (ly if t == 1 else lx)) - 0.5
+        wa += _face_slope_nb(w0, w1, mu, k, j, i, t) * dl
+        wb += _face_slope_nb(w0, w1, mu, b0, b1, b2, t) * dl
+
+    n = w0.shape[ax]
+    curv = 0.0
+    nd2 = 0
+    for c0, c1, c2 in (a0i, (b0, b1, b2)):           # second differences of w
+        c = c0 if ax == 0 else (c1 if ax == 1 else c2)
+        if 1 <= c <= n - 2:
+            m0, m1, m2 = _shift_nb(c0, c1, c2, ax, -1)
+            p0, p1, p2 = _shift_nb(c0, c1, c2, ax, 1)
+            curv += (_face_w_nb(w0, w1, mu, m0, m1, m2)
+                     - 2.0 * _face_w_nb(w0, w1, mu, c0, c1, c2)
+                     + _face_w_nb(w0, w1, mu, p0, p1, p2))
+            nd2 += 1
+    if nd2 > 0:
+        curv /= nd2
+    return ((1.0 - l) * A0 * wa + l * A1 * wb
+            + 0.25 * (A0 + A1) * curv * l * (l - 1.0))
+
+
 @njit(parallel=True, cache=True)
 def _ref_velocity_nb(pos_ref,
-                     phi_xm, phi_xp,
-                     phi_em, phi_ep,
-                     phi_zm, phi_zp,
-                     r_corners, nz, ny, nx):
+                     wx0, wy0, wz0, wx1, wy1, wz1, mu,
+                     ax, ay, az,
+                     r_corners, nz, ny, nx, order, horizontal=False):
     """
     Reference-space velocity (dξ/dt, dη/dt, dζ/dt) for each particle.
 
-    pos_ref : (N, 3)  continuous index positions (p, q, r)
-    phi_*   : (nz, ny, nx)  face fluxes [m³/s]
+    pos_ref     : (N, 3)  continuous index positions (p, q, r)
+    w?0, w?1    : face-mean normal velocity [m/s] at two snapshots, on the
+                  ξ-, η-, ζ-face grids (nz, ny, nx+1), (nz, ny+1, nx), (nz+1, ny, nx)
+    mu          : time interpolation weight of the second snapshot
+    ax, ay, az  : face areas [m²] on the same grids
+    order       : 1 or 2, see _flux_density_nb
+    horizontal  : if True, dζ/dt = 0 (particles stay on their model level)
     Returns vel_ref : (N, 3)  [s⁻¹]
 
     Cell finding is O(1): i = floor(p), ξ = p - i.  No KD-tree, no Newton.
@@ -137,9 +230,13 @@ def _ref_velocity_nb(pos_ref,
             continue   # degenerate — leave velocity at zero, particle stays put
 
         inv_J = 1.0 / J
-        vel[n, 0] = ((1.0 - xi)   * phi_xm[kn, jn, in_] + xi   * phi_xp[kn, jn, in_]) * inv_J
-        vel[n, 1] = ((1.0 - eta)  * phi_em[kn, jn, in_] + eta  * phi_ep[kn, jn, in_]) * inv_J
-        vel[n, 2] = ((1.0 - zeta) * phi_zm[kn, jn, in_] + zeta * phi_zp[kn, jn, in_]) * inv_J
+        vel[n, 0] = _flux_density_nb(wx0, wx1, mu, ax, 2, kn, jn, in_,
+                                     zeta, eta, xi, order) * inv_J
+        vel[n, 1] = _flux_density_nb(wy0, wy1, mu, ay, 1, kn, jn, in_,
+                                     zeta, eta, xi, order) * inv_J
+        if not horizontal:
+            vel[n, 2] = _flux_density_nb(wz0, wz1, mu, az, 0, kn, jn, in_,
+                                         zeta, eta, xi, order) * inv_J
 
     return vel
 
@@ -203,10 +300,13 @@ def _collect_wrf_files(pattern):
 
 def _load_snapshot_fluxes(fname, r_corners):
     """
-    Open one WRF file and compute face fluxes.
+    Open one WRF file and compute its face fluxes.
 
-    Returns a flux dict (keys xi_m/xi_p/et_m/et_p/zt_m/zt_p, shape (nz,ny,nx)).
-    Also returns (max_U, max_V, max_W) for CFL estimation.
+    Returns (w, areas, max_uvw):
+      w       : (wx, wy, wz) face-mean normal velocity flux/area [m/s] on the
+                ξ-, η-, ζ-face grids (nz, ny, nx+1), (nz, ny+1, nx), (nz+1, ny, nx)
+      areas   : (ax, ay, az) face areas [m²] on the same grids
+      max_uvw : (max_U, max_V, max_W) for CFL estimation
     """
     ds = xr.open_dataset(fname)
     # U is along the grid i direction and V along the grid j direction
@@ -221,15 +321,20 @@ def _load_snapshot_fluxes(fname, r_corners):
     max_uvw = (float(np.nanmax(np.abs(U))),
                float(np.nanmax(np.abs(V))),
                float(np.nanmax(np.abs(W))))
-    return compute_face_fluxes(U, V, W, r_corners), max_uvw
+    f = compute_face_fluxes(U, V, W, r_corners)
+    areas = (f['xi_area'], f['et_area'], f['zt_area'])
+    w = tuple(np.divide(phi, a, out=np.zeros_like(phi), where=a > 0)
+              for phi, a in zip((f['xi'], f['et'], f['zt']), areas))
+    return w, areas, max_uvw
 
 
 # ── time-dependent RK4 integrators ───────────────────────────────────────────
 
 def _wrf_integrate_timedep_nb(seeds_ref, t0, dt, nsteps,
-                               fluxes_list, t_snapshots,
+                               w_list, areas, t_snapshots,
                                r_corners, shape,
-                               frozen=False, verbose=False):
+                               frozen=False, order=2, horizontal=False,
+                               verbose=False):
     """
     Numba/Python fallback RK4 in reference space with linear time interpolation.
     Used when the C++ extension is not available.
@@ -238,29 +343,25 @@ def _wrf_integrate_timedep_nb(seeds_ref, t0, dt, nsteps,
     rc  = np.ascontiguousarray(r_corners, dtype=np.float64)
     nz_ = np.int64(nz); ny_ = np.int64(ny); nx_ = np.int64(nx)
     ts  = np.asarray(t_snapshots, dtype=np.float64)
-    nsnap = len(fluxes_list)
+    nsnap = len(w_list)
 
-    farr = [
-        {k: np.ascontiguousarray(v, dtype=np.float64) for k, v in f.items()}
-        for f in fluxes_list
-    ]
+    warr = [tuple(np.ascontiguousarray(a, dtype=np.float64) for a in w) for w in w_list]
+    ax, ay, az = (np.ascontiguousarray(a, dtype=np.float64) for a in areas)
 
     def _vel_at(pos, t):
         if frozen or nsnap == 1:
-            f = farr[0]
+            w0 = w1 = warr[0]
+            mu = 0.0
         else:
             idx = int(np.searchsorted(ts, t, side='right')) - 1
             idx = max(0, min(idx, nsnap - 2))
             t0s, t1s = ts[idx], ts[idx + 1]
-            alpha = float((t - t0s) / (t1s - t0s)) if t1s > t0s else 0.0
-            alpha = max(0.0, min(1.0, alpha))
-            f0, f1 = farr[idx], farr[idx + 1]
-            f = {k: (1.0 - alpha) * f0[k] + alpha * f1[k] for k in f0}
-        return _ref_velocity_nb(pos,
-                                f['xi_m'], f['xi_p'],
-                                f['et_m'], f['et_p'],
-                                f['zt_m'], f['zt_p'],
-                                rc, nz_, ny_, nx_)
+            mu = float((t - t0s) / (t1s - t0s)) if t1s > t0s else 0.0
+            mu = max(0.0, min(1.0, mu))
+            w0, w1 = warr[idx], warr[idx + 1]
+        return _ref_velocity_nb(pos, w0[0], w0[1], w0[2], w1[0], w1[1], w1[2], mu,
+                                ax, ay, az, rc, nz_, ny_, nx_, np.int64(order),
+                                bool(horizontal))
 
     pos = seeds_ref.copy()
     t = float(t0)
@@ -280,64 +381,56 @@ def _wrf_integrate_timedep_nb(seeds_ref, t0, dt, nsteps,
 
 
 def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
-                            fluxes_list, t_snapshots,
+                            w_list, areas, t_snapshots,
                             r_corners, shape,
-                            frozen=False, verbose=False):
+                            frozen=False, order=2, horizontal=False,
+                            verbose=False):
     """
     Dispatch to C++ integrator (ftlecpp.integrate_rk4_curvilinear) when
     available, otherwise fall back to the Numba/Python implementation.
 
+    w_list : per snapshot, (wx, wy, wz) face-mean normal velocities [m/s]
+    areas  : (ax, ay, az) face areas [m²]
+    order  : 1 = lowest-order Raviart–Thomas, 2 = quadratic across the cell
+             and linear along each face (see _flux_density_nb)
+    horizontal : if True, dr/dt = 0, i.e. particles stay on their model level
+
     The C++ version fuses all four RK4 k-evaluations into a single OpenMP
     parallel loop per step, avoiding repeated fork/join overhead and keeping
-    intermediate positions in registers.
+    intermediate positions in registers.  Positions, time and arithmetic are
+    double; the face velocities and areas are passed as float32.
     """
     if _HAVE_CPP:
-        nz, ny, nx = shape
-        nt = len(fluxes_list)
-
-        # Stack per-snapshot fluxes into (nt, nz, ny, nx) float32 arrays
-        def _stack(key):
+        def _stack(c):
             return np.ascontiguousarray(
-                np.stack([f[key] for f in fluxes_list], axis=0), dtype=np.float32)
+                np.stack([w[c] for w in w_list], axis=0), dtype=np.float32)
 
-        fxm = _stack('xi_m'); fxp = _stack('xi_p')
-        fem = _stack('et_m'); fep = _stack('et_p')
-        fzm = _stack('zt_m'); fzp = _stack('zt_p')
-
-        # Flat seeds: [p0..pN, q0..qN, r0..rN]  (seeds are at integer corners
-        # so exact in float32; intermediate positions get float32 arithmetic)
+        # Flat seeds: [p0..pN, q0..qN, r0..rN]
         N = len(seeds_ref)
         xyz0 = np.ascontiguousarray(
             np.concatenate([seeds_ref[:, 0],
                             seeds_ref[:, 1],
-                            seeds_ref[:, 2]]), dtype=np.float32)
-
-        # Corners stay float64: they are Earth-centred (~6.4e6 m), where float32
-        # resolves only ~0.5 m, too coarse for the Jacobian of thin low layers.
-        rc_f64 = np.ascontiguousarray(r_corners, dtype=np.float64)
-        t_ax   = np.asarray(t_snapshots, dtype=np.float32)
+                            seeds_ref[:, 2]]), dtype=np.float64)
 
         flat = _ftlecpp.integrate_rk4_curvilinear(
             xyz0,
             float(t0), float(dt), nsteps,
-            rc_f64,
-            fxm, fxp, fem, fep, fzm, fzp,
-            t_ax, frozen,
+            np.ascontiguousarray(r_corners, dtype=np.float64),
+            _stack(0), _stack(1), _stack(2),
+            *(np.ascontiguousarray(a, dtype=np.float32) for a in areas),
+            np.asarray(t_snapshots, dtype=np.float64),
+            frozen, order, horizontal,
         )
-
-        # Rebuild (N, 3) float64 for downstream _ref_to_cart_nb
-        return np.stack([flat[:N],
-                         flat[N:2*N],
-                         flat[2*N:]], axis=-1).astype(np.float64)
+        return np.stack([flat[:N], flat[N:2*N], flat[2*N:]], axis=-1)
 
     # ── Numba fallback ────────────────────────────────────────────────────
     if verbose:
         print('  (ftlecpp not available — using Numba fallback)')
     return _wrf_integrate_timedep_nb(
         seeds_ref, t0, dt, nsteps,
-        fluxes_list, t_snapshots,
+        w_list, areas, t_snapshots,
         r_corners, shape,
-        frozen=frozen, verbose=verbose,
+        frozen=frozen, order=order, horizontal=horizontal, verbose=verbose,
     )
 
 
@@ -416,6 +509,11 @@ class WrfFtle(FtleBase):
     wrffiles     : glob pattern matching the WRF files (e.g. 'wrf_f*.nc')
     time_index   : index into the time-sorted file list for the reference snapshot
     frozen       : if True, velocity is fixed at the reference snapshot
+    order        : 1 = lowest-order Raviart–Thomas reconstruction, 2 = quadratic
+                   across the cell and linear along each face (default)
+    horizontal   : if True, particles stay on their model level and FTLE is the
+                   stretching within each level, one 2-D field per level at the
+                   seed points; otherwise 3-D FTLE in each cell
     """
 
     def __init__(self):
@@ -423,6 +521,8 @@ class WrfFtle(FtleBase):
                                       # checksum, cmax, verbose from FtleBase
         self.wrffiles     = ""
         self.frozen       = False     # if True, fix velocity at reference snapshot
+        self.order        = 2         # velocity reconstruction order (1 or 2)
+        self.horizontal   = False     # level-following trajectories, 2-D FTLE
 
     def compute(self):
         t0_wall = time.perf_counter()
@@ -502,12 +602,12 @@ class WrfFtle(FtleBase):
         if self.verbose:
             print(f'Cells: {nz}×{ny}×{nx}')
 
-        # ── load face fluxes for each selected snapshot ───────────────────
-        fluxes_list = []
+        # ── load face velocities for each selected snapshot ───────────────
+        w_list = []
         max_uvws = []
         for i in sel_indices:
-            fluxes, uvw = _load_snapshot_fluxes(all_files[i], r_corners)
-            fluxes_list.append(fluxes)
+            w, areas, uvw = _load_snapshot_fluxes(all_files[i], r_corners)
+            w_list.append(w)
             max_uvws.append(uvw)
 
         t1_wall = time.perf_counter()
@@ -545,6 +645,8 @@ class WrfFtle(FtleBase):
         max_U = max(uvw[0] for uvw in max_uvws)
         max_V = max(uvw[1] for uvw in max_uvws)
         max_W = max(uvw[2] for uvw in max_uvws)
+        if self.horizontal:
+            max_W = 0.0               # particles stay on their level
         # Each direction contributes independently to the step count
         nsteps = max(
             int(max_U * abs(self.tintegr) / h_xi  / self.cfl) + 1,
@@ -562,9 +664,11 @@ class WrfFtle(FtleBase):
         # ── RK4 integration in reference space ───────────────────────────
         final_ref = _wrf_integrate_timedep(
             seeds_ref, t_val, dt, nsteps,
-            fluxes_list, t_snapshots,
+            w_list, areas, t_snapshots,
             r_corners, shape,
             frozen=self.frozen,
+            order=self.order,
+            horizontal=self.horizontal,
             verbose=self.verbose,
         )
 
@@ -581,8 +685,13 @@ class WrfFtle(FtleBase):
             np.int64(nz), np.int64(ny), np.int64(nx),
         ).reshape(nzp1, nyp1s, nxp1s, 3)
 
-        F    = gradient_curvilinear(Xf, rc_seed)
-        ftle = compute_ftle(F, self.tintegr)
+        if self.horizontal:
+            # one 2-D field per level, at the seed points (nz+1, ny+1, nx+1)
+            ftle = compute_ftle_horizontal(Xf, rc_seed, self.tintegr)
+        else:
+            # cell-centred 3-D field (nz, ny, nx)
+            F    = gradient_curvilinear(Xf, rc_seed)
+            ftle = compute_ftle(F, self.tintegr)
 
         t4_wall = time.perf_counter()
 
@@ -611,16 +720,18 @@ class WrfFtle(FtleBase):
         import pyvista as pv
 
         rc   = result['r_corners']   # (nzp1, nyp1, nxp1, 3)
-        ftle = result['ftle']        # (nz,   ny,   nx)
+        ftle = result['ftle']        # (nz, ny, nx) 3-D, or (nzp1, nyp1, nxp1) horizontal
         nzp1, nyp1, nxp1 = rc.shape[:3]
-        nz = nzp1 - 1
+        on_points = ftle.shape == rc.shape[:3]
+        nz = nzp1 if on_points else nzp1 - 1     # number of levels to step through
         clim = [0.0, float(cmax)] if cmax is not None else None
 
         def make_grid(k):
             g = pv.StructuredGrid()
             g.dimensions = (nxp1, nyp1, 1)
             g.points = np.ascontiguousarray(rc[k].reshape(-1, 3))
-            g.cell_data['FTLE (s⁻¹)'] = ftle[k].ravel(order='C')
+            data = g.point_data if on_points else g.cell_data
+            data['FTLE (s⁻¹)'] = ftle[k].ravel(order='C')
             return g
 
         state = {'k': int(level) % nz}
@@ -683,7 +794,7 @@ class WrfFtle(FtleBase):
 def main(*, wrffiles, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
          time_index=0, imin=None, imax=None, jmin=None,
          jmax=None, checksum=False, visualise=False, level=0, cmax=None,
-         frozen=False, verbose=False):
+         frozen=False, order=2, horizontal=False, verbose=False):
     wf = WrfFtle()
     wf.wrffiles      = wrffiles
     wf.tintegr       = tintegr
@@ -696,6 +807,8 @@ def main(*, wrffiles, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     wf.checksum      = checksum
     wf.cmax          = cmax
     wf.frozen        = frozen
+    wf.order         = order
+    wf.horizontal    = horizontal
     wf.verbose       = verbose
 
     result = wf.compute()
@@ -710,7 +823,11 @@ def main(*, wrffiles, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     g = pv.StructuredGrid()
     g.dimensions = (nxp1, nyp1, nzp1)
     g.points = rc.reshape(-1, 3)
-    g.cell_data['FTLE (s⁻¹)'] = ftle.ravel(order='C')
+    if horizontal:
+        # FTLE within each level, at the seed points
+        g.point_data['horizontal FTLE (s⁻¹)'] = ftle.ravel(order='C')
+    else:
+        g.cell_data['FTLE (s⁻¹)'] = ftle.ravel(order='C')
     g.save(vtkout)
     if verbose:
         print(f'Saved {vtkout}')
@@ -733,6 +850,14 @@ def build_parser():
                       help='Interpolate velocity in time across the integration '
                            'window (default).')
     p.set_defaults(frozen=False)
+    p.add_argument('--order', type=int, choices=(1, 2), default=2,
+                   help='Velocity reconstruction: 1 = lowest-order Raviart–Thomas '
+                        '(flux constant on each face), 2 = quadratic across the '
+                        'cell and linear along each face (default: 2).')
+    p.add_argument('--horizontal', action='store_true',
+                   help='Keep particles on their model level (no vertical motion) '
+                        'and compute the FTLE within each level, at the seed '
+                        'points (written as point data).')
     # shared flags
     FtleBase.add_common_args(p, default_vtkout='wrf_ftle.vts',
                                 default_tintegr=-3600.0)
@@ -753,6 +878,8 @@ def cli():
          level=args.level,
          cmax=args.cmax,
          frozen=args.frozen,
+         order=args.order,
+         horizontal=args.horizontal,
          verbose=args.verbose)
 
 

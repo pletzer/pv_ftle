@@ -117,6 +117,42 @@ def compute_ftle(F, tintegr):
     return np.zeros_like(lam)
 
 
+def compute_ftle_horizontal(Xf, r0, tintegr):
+    """
+    FTLE within each level surface, at every seed point.
+
+    Xf, r0 : (nl, ny1, nx1, 3)  final and initial Cartesian positions of
+             particles that stayed on their level (one 2-D lattice per level)
+    Returns (nl, ny1, nx1).
+
+    Separations along the lattice directions i and j give the surface metric
+    G = TᵀT (2×2) before (G0) and after (G1) the integration; the largest
+    squared stretch of a separation within the level is the largest root λ of
+    det(G1 - λ·G0) = 0.  Central differences in the interior, one-sided at the
+    edges of the seed region (needs at least 2 points along i and j).
+    """
+    def metric(X):
+        ti = np.gradient(X, axis=2)
+        tj = np.gradient(X, axis=1)
+        return (np.einsum('...d,...d', ti, ti),
+                np.einsum('...d,...d', ti, tj),
+                np.einsum('...d,...d', tj, tj))
+
+    a0, b0, c0 = metric(r0)
+    a1, b1, c1 = metric(Xf)
+    # det(G1 - λ G0) = A λ² + B λ + C
+    A = a0 * c0 - b0 * b0
+    B = -(a0 * c1 + c0 * a1 - 2.0 * b0 * b1)
+    C = a1 * c1 - b1 * b1
+    disc = np.sqrt(np.maximum(B * B - 4.0 * A * C, 0.0))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        lam = np.where(A > 0, (-B + disc) / (2.0 * A), np.nan)
+    lam = np.where(np.isfinite(lam), np.maximum(lam, 1e-16), np.nan)
+    if abs(tintegr) > 1e-12:
+        return np.log(lam) / (2.0 * abs(tintegr))
+    return np.zeros_like(lam)
+
+
 # ── base class ─────────────────────────────────────────────────────────────────
 
 class FtleBase:
