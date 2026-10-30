@@ -351,7 +351,7 @@ static inline void ref_vel_curv(
     const float* wx, const float* wy, const float* wz,
     const float* ax, const float* ay, const float* az,
     const double* t_arr, int nt,
-    bool frozen, int order,
+    bool frozen, int order, bool horizontal,
     double vel[3])
 {
     const int nyp1 = ny + 1, nxp1 = nx + 1;
@@ -412,7 +412,8 @@ static inline void ref_vel_curv(
     const double inv_J = 1.0 / J;
     vel[0] = flux_density(fx, 2, cell, l, order) * inv_J;   // dp/dt
     vel[1] = flux_density(fy, 1, cell, l, order) * inv_J;   // dq/dt
-    vel[2] = flux_density(fz, 0, cell, l, order) * inv_J;   // dr/dt
+    // horizontal: particles stay on their model level
+    vel[2] = horizontal ? 0.0 : flux_density(fz, 0, cell, l, order) * inv_J;   // dr/dt
 }
 
 // -----------------------------------------------------------------------------
@@ -428,6 +429,7 @@ static inline void ref_vel_curv(
 // t_axis   : (nt,)  snapshot times [s], sorted ascending
 // frozen   : if true, always use snapshot 0 (t_axis ignored)
 // order    : 1 = lowest-order Raviart–Thomas, 2 = quadratic/linear (Q₂,₁,₁)
+// horizontal: if true, dr/dt = 0, i.e. particles stay on their model level
 //
 // Returns flat float64 (3*N,) final reference positions.
 //
@@ -445,7 +447,7 @@ py::array_t<double> integrate_rk4_curvilinear(
     const f32_array& wx_arr, const f32_array& wy_arr, const f32_array& wz_arr,
     const f32_array& ax_arr, const f32_array& ay_arr, const f32_array& az_arr,
     const f64_array& t_axis,
-    bool frozen, int order)
+    bool frozen, int order, bool horizontal)
 {
     if (xyz0.ndim() != 1 || xyz0.shape(0) % 3 != 0)
         throw std::runtime_error("xyz0 must be flat float64 array of length 3*N");
@@ -496,16 +498,16 @@ py::array_t<double> integrate_rk4_curvilinear(
             double k1[3], k2[3], k3[3], k4[3];
 
             ref_vel_curv(p, q, r, t, rc, nz, ny, nx,
-                         wx, wy, wz, ax, ay, az, t_arr, nt, frozen, order, k1);
+                         wx, wy, wz, ax, ay, az, t_arr, nt, frozen, order, horizontal, k1);
             ref_vel_curv(p + 0.5*dt*k1[0], q + 0.5*dt*k1[1], r + 0.5*dt*k1[2],
                          t + 0.5*dt, rc, nz, ny, nx,
-                         wx, wy, wz, ax, ay, az, t_arr, nt, frozen, order, k2);
+                         wx, wy, wz, ax, ay, az, t_arr, nt, frozen, order, horizontal, k2);
             ref_vel_curv(p + 0.5*dt*k2[0], q + 0.5*dt*k2[1], r + 0.5*dt*k2[2],
                          t + 0.5*dt, rc, nz, ny, nx,
-                         wx, wy, wz, ax, ay, az, t_arr, nt, frozen, order, k3);
+                         wx, wy, wz, ax, ay, az, t_arr, nt, frozen, order, horizontal, k3);
             ref_vel_curv(p + dt*k3[0], q + dt*k3[1], r + dt*k3[2],
                          t + dt, rc, nz, ny, nx,
-                         wx, wy, wz, ax, ay, az, t_arr, nt, frozen, order, k4);
+                         wx, wy, wz, ax, ay, az, t_arr, nt, frozen, order, horizontal, k4);
 
             // Accumulate and freeze non-finite particles in place
             const double dt6 = dt / 6.0;
@@ -561,6 +563,7 @@ PYBIND11_MODULE(_ftlecpp, m) {
           py::arg("t_axis"),
           py::arg("frozen"),
           py::arg("order") = 2,
+          py::arg("horizontal") = false,
           "WRF / curvilinear reference-space RK4 integrator.\n\n"
           "xyz0      : flat float64 (3*N,)  [p0..pN, q0..qN, r0..rN]\n"
           "r_corners : float64 (nzp1, nyp1, nxp1, 3)  ECEF corner positions\n"
@@ -570,5 +573,6 @@ PYBIND11_MODULE(_ftlecpp, m) {
           "t_axis    : float64 (nt,)  snapshot times [s], sorted ascending\n"
           "frozen    : if True, always use snapshot 0\n"
           "order     : 1 (lowest-order Raviart–Thomas) or 2 (quadratic/linear)\n"
+          "horizontal: if True, dr/dt = 0 (particles stay on their model level)\n"
           "Returns   : flat float64 (3*N,) final reference positions.");
 }

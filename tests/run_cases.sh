@@ -24,6 +24,10 @@ wrf_ftle "data/wrf_f*.nc" "${WRF_SEEDS[@]}" \
 wrf_ftle data/wrf_f001.nc --frozen "${WRF_SEEDS[@]}" \
     --tintegr=-300 --vtkout="$OUT/wrf_frozen_f001.vts" --checksum --verbose
 
+# horizontal FTLE: particles stay on their model level
+wrf_ftle "data/wrf_f*.nc" --horizontal "${WRF_SEEDS[@]}" \
+    --tintegr=-3600 --time-index=2 --vtkout="$OUT/wrf_horizontal_timedep.vts" --checksum --verbose
+
 # lowest-order (Raviart–Thomas) velocity reconstruction
 wrf_ftle data/wrf_f001.nc --frozen --order=1 "${WRF_SEEDS[@]}" \
     --tintegr=-300 --vtkout="$OUT/wrf_frozen_f001_order1.vts" --checksum --verbose

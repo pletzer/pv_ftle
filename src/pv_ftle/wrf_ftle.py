@@ -65,6 +65,7 @@ import time
 from ftle_common import (
     gradient_curvilinear,
     compute_ftle,
+    compute_ftle_horizontal,
     FtleBase,
 )
 from wrf_ftle_curvilinear import (
@@ -177,7 +178,7 @@ def _flux_density_nb(w0, w1, mu, area, ax, k, j, i, lz, ly, lx, order):
 def _ref_velocity_nb(pos_ref,
                      wx0, wy0, wz0, wx1, wy1, wz1, mu,
                      ax, ay, az,
-                     r_corners, nz, ny, nx, order):
+                     r_corners, nz, ny, nx, order, horizontal=False):
     """
     Reference-space velocity (dξ/dt, dη/dt, dζ/dt) for each particle.
 
@@ -187,6 +188,7 @@ def _ref_velocity_nb(pos_ref,
     mu          : time interpolation weight of the second snapshot
     ax, ay, az  : face areas [m²] on the same grids
     order       : 1 or 2, see _flux_density_nb
+    horizontal  : if True, dζ/dt = 0 (particles stay on their model level)
     Returns vel_ref : (N, 3)  [s⁻¹]
 
     Cell finding is O(1): i = floor(p), ξ = p - i.  No KD-tree, no Newton.
@@ -232,8 +234,9 @@ def _ref_velocity_nb(pos_ref,
                                      zeta, eta, xi, order) * inv_J
         vel[n, 1] = _flux_density_nb(wy0, wy1, mu, ay, 1, kn, jn, in_,
                                      zeta, eta, xi, order) * inv_J
-        vel[n, 2] = _flux_density_nb(wz0, wz1, mu, az, 0, kn, jn, in_,
-                                     zeta, eta, xi, order) * inv_J
+        if not horizontal:
+            vel[n, 2] = _flux_density_nb(wz0, wz1, mu, az, 0, kn, jn, in_,
+                                         zeta, eta, xi, order) * inv_J
 
     return vel
 
@@ -330,7 +333,8 @@ def _load_snapshot_fluxes(fname, r_corners):
 def _wrf_integrate_timedep_nb(seeds_ref, t0, dt, nsteps,
                                w_list, areas, t_snapshots,
                                r_corners, shape,
-                               frozen=False, order=2, verbose=False):
+                               frozen=False, order=2, horizontal=False,
+                               verbose=False):
     """
     Numba/Python fallback RK4 in reference space with linear time interpolation.
     Used when the C++ extension is not available.
@@ -356,7 +360,8 @@ def _wrf_integrate_timedep_nb(seeds_ref, t0, dt, nsteps,
             mu = max(0.0, min(1.0, mu))
             w0, w1 = warr[idx], warr[idx + 1]
         return _ref_velocity_nb(pos, w0[0], w0[1], w0[2], w1[0], w1[1], w1[2], mu,
-                                ax, ay, az, rc, nz_, ny_, nx_, np.int64(order))
+                                ax, ay, az, rc, nz_, ny_, nx_, np.int64(order),
+                                bool(horizontal))
 
     pos = seeds_ref.copy()
     t = float(t0)
@@ -378,7 +383,8 @@ def _wrf_integrate_timedep_nb(seeds_ref, t0, dt, nsteps,
 def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
                             w_list, areas, t_snapshots,
                             r_corners, shape,
-                            frozen=False, order=2, verbose=False):
+                            frozen=False, order=2, horizontal=False,
+                            verbose=False):
     """
     Dispatch to C++ integrator (ftlecpp.integrate_rk4_curvilinear) when
     available, otherwise fall back to the Numba/Python implementation.
@@ -387,6 +393,7 @@ def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
     areas  : (ax, ay, az) face areas [m²]
     order  : 1 = lowest-order Raviart–Thomas, 2 = quadratic across the cell
              and linear along each face (see _flux_density_nb)
+    horizontal : if True, dr/dt = 0, i.e. particles stay on their model level
 
     The C++ version fuses all four RK4 k-evaluations into a single OpenMP
     parallel loop per step, avoiding repeated fork/join overhead and keeping
@@ -412,7 +419,7 @@ def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
             _stack(0), _stack(1), _stack(2),
             *(np.ascontiguousarray(a, dtype=np.float32) for a in areas),
             np.asarray(t_snapshots, dtype=np.float64),
-            frozen, order,
+            frozen, order, horizontal,
         )
         return np.stack([flat[:N], flat[N:2*N], flat[2*N:]], axis=-1)
 
@@ -423,7 +430,7 @@ def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
         seeds_ref, t0, dt, nsteps,
         w_list, areas, t_snapshots,
         r_corners, shape,
-        frozen=frozen, order=order, verbose=verbose,
+        frozen=frozen, order=order, horizontal=horizontal, verbose=verbose,
     )
 
 
@@ -504,6 +511,9 @@ class WrfFtle(FtleBase):
     frozen       : if True, velocity is fixed at the reference snapshot
     order        : 1 = lowest-order Raviart–Thomas reconstruction, 2 = quadratic
                    across the cell and linear along each face (default)
+    horizontal   : if True, particles stay on their model level and FTLE is the
+                   stretching within each level, one 2-D field per level at the
+                   seed points; otherwise 3-D FTLE in each cell
     """
 
     def __init__(self):
@@ -512,6 +522,7 @@ class WrfFtle(FtleBase):
         self.wrffiles     = ""
         self.frozen       = False     # if True, fix velocity at reference snapshot
         self.order        = 2         # velocity reconstruction order (1 or 2)
+        self.horizontal   = False     # level-following trajectories, 2-D FTLE
 
     def compute(self):
         t0_wall = time.perf_counter()
@@ -634,6 +645,8 @@ class WrfFtle(FtleBase):
         max_U = max(uvw[0] for uvw in max_uvws)
         max_V = max(uvw[1] for uvw in max_uvws)
         max_W = max(uvw[2] for uvw in max_uvws)
+        if self.horizontal:
+            max_W = 0.0               # particles stay on their level
         # Each direction contributes independently to the step count
         nsteps = max(
             int(max_U * abs(self.tintegr) / h_xi  / self.cfl) + 1,
@@ -655,6 +668,7 @@ class WrfFtle(FtleBase):
             r_corners, shape,
             frozen=self.frozen,
             order=self.order,
+            horizontal=self.horizontal,
             verbose=self.verbose,
         )
 
@@ -671,8 +685,13 @@ class WrfFtle(FtleBase):
             np.int64(nz), np.int64(ny), np.int64(nx),
         ).reshape(nzp1, nyp1s, nxp1s, 3)
 
-        F    = gradient_curvilinear(Xf, rc_seed)
-        ftle = compute_ftle(F, self.tintegr)
+        if self.horizontal:
+            # one 2-D field per level, at the seed points (nz+1, ny+1, nx+1)
+            ftle = compute_ftle_horizontal(Xf, rc_seed, self.tintegr)
+        else:
+            # cell-centred 3-D field (nz, ny, nx)
+            F    = gradient_curvilinear(Xf, rc_seed)
+            ftle = compute_ftle(F, self.tintegr)
 
         t4_wall = time.perf_counter()
 
@@ -701,16 +720,18 @@ class WrfFtle(FtleBase):
         import pyvista as pv
 
         rc   = result['r_corners']   # (nzp1, nyp1, nxp1, 3)
-        ftle = result['ftle']        # (nz,   ny,   nx)
+        ftle = result['ftle']        # (nz, ny, nx) 3-D, or (nzp1, nyp1, nxp1) horizontal
         nzp1, nyp1, nxp1 = rc.shape[:3]
-        nz = nzp1 - 1
+        on_points = ftle.shape == rc.shape[:3]
+        nz = nzp1 if on_points else nzp1 - 1     # number of levels to step through
         clim = [0.0, float(cmax)] if cmax is not None else None
 
         def make_grid(k):
             g = pv.StructuredGrid()
             g.dimensions = (nxp1, nyp1, 1)
             g.points = np.ascontiguousarray(rc[k].reshape(-1, 3))
-            g.cell_data['FTLE (s⁻¹)'] = ftle[k].ravel(order='C')
+            data = g.point_data if on_points else g.cell_data
+            data['FTLE (s⁻¹)'] = ftle[k].ravel(order='C')
             return g
 
         state = {'k': int(level) % nz}
@@ -773,7 +794,7 @@ class WrfFtle(FtleBase):
 def main(*, wrffiles, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
          time_index=0, imin=None, imax=None, jmin=None,
          jmax=None, checksum=False, visualise=False, level=0, cmax=None,
-         frozen=False, order=2, verbose=False):
+         frozen=False, order=2, horizontal=False, verbose=False):
     wf = WrfFtle()
     wf.wrffiles      = wrffiles
     wf.tintegr       = tintegr
@@ -787,6 +808,7 @@ def main(*, wrffiles, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     wf.cmax          = cmax
     wf.frozen        = frozen
     wf.order         = order
+    wf.horizontal    = horizontal
     wf.verbose       = verbose
 
     result = wf.compute()
@@ -801,7 +823,11 @@ def main(*, wrffiles, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     g = pv.StructuredGrid()
     g.dimensions = (nxp1, nyp1, nzp1)
     g.points = rc.reshape(-1, 3)
-    g.cell_data['FTLE (s⁻¹)'] = ftle.ravel(order='C')
+    if horizontal:
+        # FTLE within each level, at the seed points
+        g.point_data['horizontal FTLE (s⁻¹)'] = ftle.ravel(order='C')
+    else:
+        g.cell_data['FTLE (s⁻¹)'] = ftle.ravel(order='C')
     g.save(vtkout)
     if verbose:
         print(f'Saved {vtkout}')
@@ -828,6 +854,10 @@ def build_parser():
                    help='Velocity reconstruction: 1 = lowest-order Raviart–Thomas '
                         '(flux constant on each face), 2 = quadratic across the '
                         'cell and linear along each face (default: 2).')
+    p.add_argument('--horizontal', action='store_true',
+                   help='Keep particles on their model level (no vertical motion) '
+                        'and compute the FTLE within each level, at the seed '
+                        'points (written as point data).')
     # shared flags
     FtleBase.add_common_args(p, default_vtkout='wrf_ftle.vts',
                                 default_tintegr=-3600.0)
@@ -849,6 +879,7 @@ def cli():
          cmax=args.cmax,
          frozen=args.frozen,
          order=args.order,
+         horizontal=args.horizontal,
          verbose=args.verbose)
 
 

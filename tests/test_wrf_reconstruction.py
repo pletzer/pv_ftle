@@ -171,3 +171,53 @@ def test_cpp_matches_numba(order, monkeypatch):
     # face velocities are float32 in C++, float64 in numba
     assert np.abs(cpp - nb).max() < 1e-5
     assert np.abs(cpp - seeds).max() > 0.1          # particles actually moved
+
+
+# ── horizontal (level-following) mode ─────────────────────────────────────────
+
+def _tilted_lattice(nl=3, ny1=6, nx1=7, dx=1000.0, dy=800.0):
+    """Planar lattices (one per level) in an arbitrarily rotated plane, with
+    an in-plane orthonormal basis (e1, e2)."""
+    rng = np.random.default_rng(4)
+    q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+    e1, e2, e3 = q.T
+    j, i = np.mgrid[0:ny1, 0:nx1]
+    r0 = np.stack([(i * dx)[..., None] * e1 + (j * dy)[..., None] * e2 + 50.0 * k * e3
+                   for k in range(nl)])
+    return r0, e1, e2, i * dx, j * dy
+
+
+@pytest.mark.parametrize('M', ([[1.0, 0.0], [0.0, 1.0]],      # no motion
+                               [[0.6, -0.8], [0.8, 0.6]],     # rotation
+                               [[1.0, 0.5], [0.0, 1.0]],      # shear
+                               [[2.0, 0.0], [0.3, 0.7]]),     # general
+                         ids=('identity', 'rotation', 'shear', 'general'))
+def test_horizontal_ftle_of_linear_deformation(M):
+    """In-plane linear map M: FTLE = ln(σ_max(M)) / |T| at every point."""
+    M = np.array(M)
+    T = -600.0
+    r0, e1, e2, x, y = _tilted_lattice()
+    shift = np.array([123.0, -45.0, 6.0])               # translation must not matter
+    xf, yf = M[0, 0] * x + M[0, 1] * y, M[1, 0] * x + M[1, 1] * y
+    Xf = np.stack([xf[..., None] * e1 + yf[..., None] * e2 + (r0[k] - r0[0]) + shift
+                   for k in range(r0.shape[0])])
+    expected = np.log(np.linalg.svd(M, compute_uv=False)[0]) / abs(T)
+    got = wf.compute_ftle_horizontal(Xf, r0, T)
+    # atol: for equal stretches (rotation) the discriminant is 0 and its square
+    # root turns round-off into ~1e-8 in λ, i.e. ~1e-11 s⁻¹ (FTLE here ~1e-3)
+    np.testing.assert_allclose(got, expected, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize('use_cpp', (False, True))
+def test_horizontal_mode_keeps_particles_on_their_level(use_cpp, monkeypatch):
+    if use_cpp and not wf._HAVE_CPP:
+        pytest.skip('C++ extension not built')
+    monkeypatch.setattr(wf, '_HAVE_CPP', use_cpp)
+    rc, w, areas, _ = make_case(STRETCHED)
+    rng = np.random.default_rng(5)
+    seeds = np.column_stack([rng.uniform(1, NX - 1, 300), rng.uniform(1, NY - 1, 300),
+                             rng.integers(0, NZ + 1, 300).astype(float)])
+    args = (seeds, 0.0, -20.0, 30, [w], areas, np.array([0.0]), rc, (NZ, NY, NX))
+    out = wf._wrf_integrate_timedep(*args, frozen=True, order=2, horizontal=True)
+    assert np.array_equal(out[:, 2], seeds[:, 2])
+    assert np.abs(out[:, :2] - seeds[:, :2]).max() > 0.1   # moved horizontally
