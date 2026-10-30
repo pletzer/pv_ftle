@@ -36,7 +36,12 @@ jobs:
         run: |
           pip install --no-build-isolation .
           # extra runtime deps of the WRF tools not listed in setup.py
-          pip install scipy xarray numba pyvista
+          pip install scipy xarray numba pyvista pytest
+
+      - name: Unit tests
+        # run from outside the checkout so the installed package (with the
+        # compiled extension) is imported, not src/
+        run: cd "$RUNNER_TEMP" && python -m pytest "$GITHUB_WORKSPACE/tests" -v
 
       - name: Run FTLE cases
         run: tests/run_cases.sh "$OUT"
