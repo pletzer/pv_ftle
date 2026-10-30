@@ -1,862 +1,619 @@
 """
-wrf_ftle.py – Finite-Time Lyapunov Exponent for WRF output.
+wrf_ftle.py – WRF FTLE via reference-space (index-space) integration.
 
-Mimetic velocity reconstruction on a curvilinear (terrain-following) 3-D grid.
-Positions are 3-D Cartesian (metres from Earth centre) to avoid pole singularities.
+Tracks particles in continuous index coordinates (p, q, r) = (i+ξ, j+η, k+ζ).
+wrf_ftle_curvilinear.py integrates the same mimetic velocity field in
+Cartesian (x, y, z) instead and is kept as an independent cross-check.
 
-Cell corner numbering for cell (k, j, i)  [k=vertical, j=south-north, i=west-east]:
+Advantages over the Cartesian integration
+-----------------------------------------
+* No KD-tree at all — cell finding is O(1): i = floor(p), ξ = p - i.
+* No Newton iteration — the cell is always exactly known.
+* Particles on the ground stay on it exactly (dζ/dt = 0 at ζ = 0).
+* Simpler integrator loop with no bookkeeping of warm hints.
 
-  ζ=0 (bottom):                    ζ=1 (top):
-    r3(k,j+1,i)---r2(k,j+1,i+1)     r7(k+1,j+1,i)---r6(k+1,j+1,i+1)
-        |               |                 |                 |
-    r0(k,j,  i)---r1(k,j,  i+1)     r4(k+1,j,  i)---r5(k+1,j,  i+1)
+How it works
+------------
+Starting from the mimetic velocity reconstruction in Cartesian space:
 
-  ξ: r0→r1 (west→east)
-  η: r0→r3 (south→north)
-  ζ: r0→r4 (bottom→top)
+  u = J⁻¹ × [((1-ξ)φ_ξ⁻ + ξ φ_ξ⁺) ∂r/∂ξ
+              ((1-η)φ_η⁻ + η φ_η⁺) ∂r/∂η   /  J
+              ((1-ζ)φ_ζ⁻ + ζ φ_ζ⁺) ∂r/∂ζ]
 
-Face fluxes φ = U·A (velocity × face area magnitude) are precomputed for all 6
-faces of every cell. Inside a cell the velocity is reconstructed mimetically:
+Applying J⁻¹ and using J⁻¹ · ∂r/∂ξ = ê_ξ, etc.:
 
-  u = Σ_f  φ_f · w_f(ξ,η,ζ) · ∂r/∂s_f / J
+  dξ/dt = [(1-ξ) φ_ξ⁻ + ξ φ_ξ⁺] / J(ξ,η,ζ)          (units: s⁻¹)
+  dη/dt = [(1-η) φ_η⁻ + η φ_η⁺] / J(ξ,η,ζ)
+  dζ/dt = [(1-ζ) φ_ζ⁻ + ζ φ_ζ⁺] / J(ξ,η,ζ)
 
-where w_f is the Whitney-like weight (e.g. (1-ξ) for the ξ=0 face),
-∂r/∂s_f is the corresponding partial derivative of the trilinear map, and
-J = ∂r/∂ξ · (∂r/∂η × ∂r/∂ζ) is the Jacobian.
+where φ are the face fluxes (m³ s⁻¹, same as wrf_ftle_curvilinear.py) and
+J = ∂r/∂ξ · (∂r/∂η × ∂r/∂ζ) is the Jacobian det (m³).
 
-Wind components
----------------
-WRF stores U and V grid-relative for every map projection: U is the horizontal
-wind component along the grid i (west_east) direction, V along the grid j
-(south_north) direction.  WRF projections are conformal, so these directions are
-orthogonal and U, V are exactly the components normal to the constant-i and
-constant-j cell faces.  The face fluxes therefore use U and V as stored, and no
-rotation with COSALPHA/SINALPHA is needed.  (Those fields only serve to convert
-grid-relative winds to Earth-relative east/north components, e.g. for plotting.)
+The only per-sub-step work is one call to _trilinear_derivs_nb (to compute J)
+and six scalar multiplications — much cheaper than the Newton iteration in the
+Cartesian version.
+
+After integration, final reference positions are converted back to Cartesian
+via the trilinear map and FTLE is computed identically to wrf_ftle_curvilinear.py.
+
+Multi-file / time-dependent mode
+---------------------------------
+The positional argument is a glob pattern matching one or more WRF output files
+(e.g. 'wrf_f*.nc').  Each file is expected to hold exactly one time step.
+Files are sorted by their XTIME attribute (minutes since simulation start).
+
+--time-index selects the reference snapshot (index into the sorted file list).
+By default the velocity field is interpolated linearly between snapshots across
+the integration window so that particles see a time-varying flow.
+
+Pass --frozen to fix the velocity at the reference snapshot (faster, single
+file read).  This is equivalent to the old single-file behaviour.
+
+Cell corner numbering: identical to wrf_ftle_curvilinear.py (see docstring there).
 """
 
+import glob as _glob
 import math
 
 import numpy as np
 import xarray as xr
-from scipy.spatial import cKDTree
 from numba import njit, prange
 import argparse
 import time
 
-R_EARTH = 6_371_000.0  # metres
+# ── shared infrastructure ─────────────────────────────────────────────────────
+from ftle_common import (
+    gradient_curvilinear,
+    compute_ftle,
+    FtleBase,
+)
+from wrf_ftle_curvilinear import (
+    build_corner_positions,
+    compute_face_fluxes,
+    _trilinear_map_nb,        # Numba helpers shared with PALM
+    _trilinear_derivs_nb,
+    _get_corners_nb,
+)
 
-# ── coordinate helpers ────────────────────────────────────────────────────────
-
-def latlon_to_cart(lat_deg, lon_deg, radius):
-    """(lat°, lon°, radius m) → Cartesian (x,y,z) m.  Shapes broadcast."""
-    lat = np.deg2rad(lat_deg)
-    lon = np.deg2rad(lon_deg)
-    x = radius * np.cos(lat) * np.cos(lon)
-    y = radius * np.cos(lat) * np.sin(lon)
-    z = radius * np.sin(lat)
-    return np.stack([x, y, z], axis=-1)   # (..., 3)
+# ── C++ integrator (optional — falls back to Numba if not yet compiled) ───────
+try:
+    from pv_ftle import _ftlecpp as _ftlecpp
+    _HAVE_CPP = True
+except ImportError:
+    _HAVE_CPP = False
 
 
-# ── corner-grid construction ──────────────────────────────────────────────────
+# ── reference-space Numba kernels ─────────────────────────────────────────────
 
-def _centres_to_corners_2d(field):
+@njit(parallel=True, cache=True)
+def _ref_velocity_nb(pos_ref,
+                     phi_xm, phi_xp,
+                     phi_em, phi_ep,
+                     phi_zm, phi_zp,
+                     r_corners, nz, ny, nx):
     """
-    (ny, nx) cell-centre field → (ny+1, nx+1) corner field.
-    The field is padded with one ring of ghost centres obtained by linear
-    extrapolation (g = 2·f_edge − f_inner, i.e. odd reflection), then every
-    corner is the average of its 4 surrounding (real or ghost) centres.
-    Linear fields are reproduced exactly, including at the boundary, so the
-    outer row/column of cells keeps its full width.
+    Reference-space velocity (dξ/dt, dη/dt, dζ/dt) for each particle.
+
+    pos_ref : (N, 3)  continuous index positions (p, q, r)
+    phi_*   : (nz, ny, nx)  face fluxes [m³/s]
+    Returns vel_ref : (N, 3)  [s⁻¹]
+
+    Cell finding is O(1): i = floor(p), ξ = p - i.  No KD-tree, no Newton.
     """
-    # float64: WRF fields are float32, too coarse for Earth-centred positions
-    f = np.pad(np.asarray(field, dtype=np.float64), 1,
-               mode='reflect', reflect_type='odd')             # (ny+2, nx+2)
-    return 0.25 * (f[:-1, :-1] + f[:-1, 1:] + f[1:, :-1] + f[1:, 1:])
+    N = len(pos_ref)
+    vel = np.zeros((N, 3))
 
+    for n in prange(N):
+        p = pos_ref[n, 0]
+        q = pos_ref[n, 1]
+        r = pos_ref[n, 2]
 
-def _build_horizontal_corners(lats, lons):
-    """
-    Interpolate mass-grid (ny, nx) lat/lon to (ny+1, nx+1) corner positions.
-    Interpolation done in Cartesian to avoid longitude wrap-around near poles.
-    Returns lat_c, lon_c in degrees, each (ny+1, nx+1).
-    """
-    lr = np.deg2rad(lats);  nr = np.deg2rad(lons)
-    cx = np.cos(lr) * np.cos(nr)
-    cy = np.cos(lr) * np.sin(nr)
-    cz = np.sin(lr)
-    xc = _centres_to_corners_2d(cx)
-    yc = _centres_to_corners_2d(cy)
-    zc = _centres_to_corners_2d(cz)
-    r  = np.sqrt(xc**2 + yc**2 + zc**2)
-    xc /= r;  yc /= r;  zc /= r
-    return np.rad2deg(np.arcsin(np.clip(zc, -1, 1))), np.rad2deg(np.arctan2(yc, xc))
+        # O(1) cell index + local barycentric coords
+        in_ = min(max(int(math.floor(p)), 0), nx - 1)
+        jn  = min(max(int(math.floor(q)), 0), ny - 1)
+        kn  = min(max(int(math.floor(r)), 0), nz - 1)
 
+        xi   = min(max(p - float(in_), 0.0), 1.0)
+        eta  = min(max(q - float(jn),  0.0), 1.0)
+        zeta = min(max(r - float(kn),  0.0), 1.0)
 
-def build_corner_positions(lats, lons, heights_w):
-    """
-    Build 3-D Cartesian corner positions.
+        # Jacobian at (xi, eta, zeta) — needed to convert flux → ref velocity
+        corners = _get_corners_nb(r_corners, kn, jn, in_)
+        dxi, det, dzt = _trilinear_derivs_nb(corners, xi, eta, zeta)
 
-    lats, lons  : (ny, nx)   mass-grid lat/lon (degrees)
-    heights_w   : (nz+1, ny, nx)  geopotential height at W-stagger levels (m)
+        j00 = dxi[0]; j10 = dxi[1]; j20 = dxi[2]
+        j01 = det[0]; j11 = det[1]; j21 = det[2]
+        j02 = dzt[0]; j12 = dzt[1]; j22 = dzt[2]
 
-    Returns r_corners : (nz+1, ny+1, nx+1, 3)  in metres from Earth centre.
-    """
-    nzp1, ny, nx = heights_w.shape
-    lat_c, lon_c = _build_horizontal_corners(lats, lons)   # (ny+1, nx+1)
+        J = (j00*(j11*j22 - j12*j21)
+           - j01*(j10*j22 - j12*j20)
+           + j02*(j10*j21 - j11*j20))
 
-    # Interpolate heights horizontally to corner positions at each W-level
-    h_c = np.stack([_centres_to_corners_2d(heights_w[k]) for k in range(nzp1)])
-    # h_c : (nz+1, ny+1, nx+1)
-
-    radius = R_EARTH + h_c                              # (nz+1, ny+1, nx+1)
-    return latlon_to_cart(lat_c[np.newaxis], lon_c[np.newaxis], radius)
-    # → (nz+1, ny+1, nx+1, 3)
-
-
-# ── trilinear cell geometry ───────────────────────────────────────────────────
-
-def _get_cell_corners(r_corners, k, j, i):
-    """
-    Extract 8 corner positions for cells indexed by integer arrays k, j, i (shape N).
-    Returns (N, 8, 3).
-    """
-    return np.stack([
-        r_corners[k,   j,   i  ],   # r0
-        r_corners[k,   j,   i+1],   # r1
-        r_corners[k,   j+1, i+1],   # r2
-        r_corners[k,   j+1, i  ],   # r3
-        r_corners[k+1, j,   i  ],   # r4
-        r_corners[k+1, j,   i+1],   # r5
-        r_corners[k+1, j+1, i+1],   # r6
-        r_corners[k+1, j+1, i  ],   # r7
-    ], axis=1)   # (N, 8, 3)
-
-
-def _trilinear_map(corners, xi, eta, zeta):
-    """
-    Evaluate trilinear map r(ξ,η,ζ).
-    corners : (N, 8, 3);  xi, eta, zeta : (N,) → returns (N, 3).
-    """
-    a = xi  [:, None];  b = eta[:, None];  c = zeta[:, None]
-    r = corners
-    return ((1-a)*(1-b)*(1-c)*r[:,0] +    a*(1-b)*(1-c)*r[:,1]
-           +   a*   b*(1-c)*r[:,2] + (1-a)*   b*(1-c)*r[:,3]
-           + (1-a)*(1-b)*   c*r[:,4]+    a*(1-b)*   c*r[:,5]
-           +   a*   b*   c*r[:,6] + (1-a)*   b*   c*r[:,7])
-
-
-def _trilinear_derivs(corners, xi, eta, zeta):
-    """
-    ∂r/∂ξ, ∂r/∂η, ∂r/∂ζ at barycentric (ξ,η,ζ).
-    corners : (N, 8, 3);  scalars : (N,) → three (N, 3) arrays.
-    """
-    a = xi  [:, None];  b = eta[:, None];  c = zeta[:, None]
-    r = corners
-    dr_dxi   = ((1-b)*(1-c)*(r[:,1]-r[:,0]) +    b*(1-c)*(r[:,2]-r[:,3])
-              + (1-b)*   c*(r[:,5]-r[:,4]) +    b*   c*(r[:,6]-r[:,7]))
-    dr_deta  = ((1-a)*(1-c)*(r[:,3]-r[:,0]) +    a*(1-c)*(r[:,2]-r[:,1])
-              + (1-a)*   c*(r[:,7]-r[:,4]) +    a*   c*(r[:,6]-r[:,5]))
-    dr_dzeta = ((1-a)*(1-b)*(r[:,4]-r[:,0]) +    a*(1-b)*(r[:,5]-r[:,1])
-              +    a*   b*(r[:,6]-r[:,2]) + (1-a)*   b*(r[:,7]-r[:,3]))
-    return dr_dxi, dr_deta, dr_dzeta
-
-
-# ── Numba-accelerated Newton iteration ───────────────────────────────────────
-
-@njit(cache=True)
-def _trilinear_map_nb(corners, a, b, c):
-    """Trilinear map for a single cell.  corners:(8,3), a/b/c scalars → (3,)."""
-    out = np.empty(3)
-    for d in range(3):
-        out[d] = ((1-a)*(1-b)*(1-c)*corners[0, d]
-               +     a*(1-b)*(1-c)*corners[1, d]
-               +     a*   b*(1-c)*corners[2, d]
-               +  (1-a)*  b*(1-c)*corners[3, d]
-               +  (1-a)*(1-b)*  c*corners[4, d]
-               +     a*(1-b)*  c*corners[5, d]
-               +     a*   b*  c*corners[6, d]
-               +  (1-a)*  b*  c*corners[7, d])
-    return out
-
-
-@njit(cache=True)
-def _trilinear_derivs_nb(corners, a, b, c):
-    """∂r/∂ξ, ∂r/∂η, ∂r/∂ζ for a single cell.  corners:(8,3) → three (3,)."""
-    dxi  = np.empty(3)
-    deta = np.empty(3)
-    dzt  = np.empty(3)
-    for d in range(3):
-        dxi[d]  = ((1-b)*(1-c)*(corners[1,d]-corners[0,d])
-                +     b*(1-c)*(corners[2,d]-corners[3,d])
-                +  (1-b)*  c*(corners[5,d]-corners[4,d])
-                +     b*   c*(corners[6,d]-corners[7,d]))
-        deta[d] = ((1-a)*(1-c)*(corners[3,d]-corners[0,d])
-                +     a*(1-c)*(corners[2,d]-corners[1,d])
-                +  (1-a)*  c*(corners[7,d]-corners[4,d])
-                +     a*   c*(corners[6,d]-corners[5,d]))
-        dzt[d]  = ((1-a)*(1-b)*(corners[4,d]-corners[0,d])
-                +     a*(1-b)*(corners[5,d]-corners[1,d])
-                +     a*   b*(corners[6,d]-corners[2,d])
-                +  (1-a)*  b*(corners[7,d]-corners[3,d]))
-    return dxi, deta, dzt
-
-
-@njit(cache=True)
-def _get_corners_nb(r_corners, kn, jn, in_):
-    """Extract the 8 corner positions of cell (kn, jn, in_) into a (8, 3) array."""
-    corners = np.empty((8, 3))
-    for d in range(3):
-        corners[0, d] = r_corners[kn,   jn,   in_,   d]
-        corners[1, d] = r_corners[kn,   jn,   in_+1, d]
-        corners[2, d] = r_corners[kn,   jn+1, in_+1, d]
-        corners[3, d] = r_corners[kn,   jn+1, in_,   d]
-        corners[4, d] = r_corners[kn+1, jn,   in_,   d]
-        corners[5, d] = r_corners[kn+1, jn,   in_+1, d]
-        corners[6, d] = r_corners[kn+1, jn+1, in_+1, d]
-        corners[7, d] = r_corners[kn+1, jn+1, in_,   d]
-    return corners
-
-
-@njit(cache=True)
-def _newton_in_cell(pos_n, corners, max_iter):
-    """
-    Newton iteration for one particle inside one specific cell.
-
-    pos_n   : (3,)   particle Cartesian position
-    corners : (8, 3) cell corner positions
-    Returns (xi, eta, zeta, residual_squared).
-
-    Barycentric coords are clamped to [0, 1]; the residual_squared measures
-    how far the clamped point is from pos_n — zero means the particle is
-    genuinely inside this cell.
-    """
-    a, b, c = 0.5, 0.5, 0.5
-
-    for _ in range(max_iter):
-        r_est = _trilinear_map_nb(corners, a, b, c)
-        resid0 = pos_n[0] - r_est[0]
-        resid1 = pos_n[1] - r_est[1]
-        resid2 = pos_n[2] - r_est[2]
-
-        dr_dxi, dr_deta, dr_dzt = _trilinear_derivs_nb(corners, a, b, c)
-
-        j00 = dr_dxi[0];  j10 = dr_dxi[1];  j20 = dr_dxi[2]
-        j01 = dr_deta[0]; j11 = dr_deta[1]; j21 = dr_deta[2]
-        j02 = dr_dzt[0];  j12 = dr_dzt[1];  j22 = dr_dzt[2]
-
-        det = (j00*(j11*j22 - j12*j21)
-             - j01*(j10*j22 - j12*j20)
-             + j02*(j10*j21 - j11*j20))
-
+        # Scale-invariant singularity guard (degenerate terrain-following cell)
         col0 = math.sqrt(j00*j00 + j10*j10 + j20*j20)
         col1 = math.sqrt(j01*j01 + j11*j11 + j21*j21)
         col2 = math.sqrt(j02*j02 + j12*j12 + j22*j22)
-        if math.fabs(det) < 1e-6 * col0 * col1 * col2:
-            break
+        if math.fabs(J) < 1e-6 * col0 * col1 * col2:
+            continue   # degenerate — leave velocity at zero, particle stays put
 
-        inv_det = 1.0 / det
-        d0 = inv_det * (resid0*(j11*j22-j12*j21)
-                      - j01*(resid1*j22-j12*resid2)
-                      + j02*(resid1*j21-j11*resid2))
-        d1 = inv_det * (j00*(resid1*j22-j12*resid2)
-                      - resid0*(j10*j22-j12*j20)
-                      + j02*(j10*resid2-resid1*j20))
-        d2 = inv_det * (j00*(j11*resid2-resid1*j21)
-                      - j01*(j10*resid2-resid1*j20)
-                      + resid0*(j10*j21-j11*j20))
+        inv_J = 1.0 / J
+        vel[n, 0] = ((1.0 - xi)   * phi_xm[kn, jn, in_] + xi   * phi_xp[kn, jn, in_]) * inv_J
+        vel[n, 1] = ((1.0 - eta)  * phi_em[kn, jn, in_] + eta  * phi_ep[kn, jn, in_]) * inv_J
+        vel[n, 2] = ((1.0 - zeta) * phi_zm[kn, jn, in_] + zeta * phi_zp[kn, jn, in_]) * inv_J
 
-        a = min(max(a + d0, 0.0), 1.0)
-        b = min(max(b + d1, 0.0), 1.0)
-        c = min(max(c + d2, 0.0), 1.0)
-
-        if math.fabs(d0) + math.fabs(d1) + math.fabs(d2) < 3e-10:
-            break
-
-    r_est = _trilinear_map_nb(corners, a, b, c)
-    resid_sq = ((pos_n[0] - r_est[0])**2
-              + (pos_n[1] - r_est[1])**2
-              + (pos_n[2] - r_est[2])**2)
-    return a, b, c, resid_sq
+    return vel
 
 
 @njit(parallel=True, cache=True)
-def _newton_bary(pos, k, j, i, r_corners, nz, ny, nx, max_iter):
+def _ref_to_cart_nb(pos_ref, r_corners, nz, ny, nx):
     """
-    Parallel Newton iteration with neighbour-cell walk.
-
-    pos       : (N, 3) float64
-    k, j, i   : (N,)   int64  — starting cell hints
-    r_corners : (nz+1, ny+1, nx+1, 3) float64
-    nz, ny, nx: grid cell counts (int64)
-
-    For each particle, Newton is first attempted in the hinted cell.  If any
-    barycentric coordinate is pinned to 0 or 1 (particle tried to leave the
-    cell), the six face-neighbours are tried in order and the one with the
-    smallest residual is accepted.  With CFL ≤ 0.25 at most one face is ever
-    crossed per call, so a single walk step is always sufficient.
-
-    Returns xi, eta, zeta, k_out, j_out, i_out : (N,) each.
-    The returned k/j/i reflect any cell that was walked into, so callers can
-    use them as warm hints for the next call.
+    Convert reference positions (N, 3) → Cartesian (N, 3) via trilinear map.
+    Used to recover physical positions for FTLE computation after integration.
     """
-    N = len(pos)
-    xi_out   = np.empty(N)
-    eta_out  = np.empty(N)
-    zeta_out = np.empty(N)
-    k_out = k.copy()
-    j_out = j.copy()
-    i_out = i.copy()
-
-    FACE_TOL = 1e-8   # bary coord is considered "on the face" if within this of 0 or 1
+    N = len(pos_ref)
+    cart = np.empty((N, 3))
 
     for n in prange(N):
-        kn = k[n];  jn = j[n];  in_ = i[n]
+        p = pos_ref[n, 0]
+        q = pos_ref[n, 1]
+        r = pos_ref[n, 2]
+
+        in_ = min(max(int(math.floor(p)), 0), nx - 1)
+        jn  = min(max(int(math.floor(q)), 0), ny - 1)
+        kn  = min(max(int(math.floor(r)), 0), nz - 1)
+
+        xi   = min(max(p - float(in_), 0.0), 1.0)
+        eta  = min(max(q - float(jn),  0.0), 1.0)
+        zeta = min(max(r - float(kn),  0.0), 1.0)
 
         corners = _get_corners_nb(r_corners, kn, jn, in_)
-        a, b, c, resid_sq = _newton_in_cell(pos[n], corners, max_iter)
+        pt = _trilinear_map_nb(corners, xi, eta, zeta)
+        cart[n, 0] = pt[0]
+        cart[n, 1] = pt[1]
+        cart[n, 2] = pt[2]
 
-        # ── neighbour walk ───────────────────────────────────────────────────
-        # If a bary coord is pinned to a face (0 or 1) the particle may have
-        # crossed into the adjacent cell.  Try the neighbour; accept it if its
-        # residual is smaller (particle is genuinely inside that cell).
-        # We try all 6 faces but stop as soon as one walk succeeds, since CFL
-        # guarantees at most one face crossing per step.
-        walked = False
-
-        if not walked and a > 1.0 - FACE_TOL and in_ < nx - 1:
-            nbr = _get_corners_nb(r_corners, kn, jn, in_ + 1)
-            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
-            if rz < resid_sq:
-                a, b, c, resid_sq = az, bz, cz, rz;  in_ += 1;  walked = True
-
-        if not walked and a < FACE_TOL and in_ > 0:
-            nbr = _get_corners_nb(r_corners, kn, jn, in_ - 1)
-            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
-            if rz < resid_sq:
-                a, b, c, resid_sq = az, bz, cz, rz;  in_ -= 1;  walked = True
-
-        if not walked and b > 1.0 - FACE_TOL and jn < ny - 1:
-            nbr = _get_corners_nb(r_corners, kn, jn + 1, in_)
-            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
-            if rz < resid_sq:
-                a, b, c, resid_sq = az, bz, cz, rz;  jn += 1;  walked = True
-
-        if not walked and b < FACE_TOL and jn > 0:
-            nbr = _get_corners_nb(r_corners, kn, jn - 1, in_)
-            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
-            if rz < resid_sq:
-                a, b, c, resid_sq = az, bz, cz, rz;  jn -= 1;  walked = True
-
-        if not walked and c > 1.0 - FACE_TOL and kn < nz - 1:
-            nbr = _get_corners_nb(r_corners, kn + 1, jn, in_)
-            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
-            if rz < resid_sq:
-                a, b, c, resid_sq = az, bz, cz, rz;  kn += 1;  walked = True
-
-        if not walked and c < FACE_TOL and kn > 0:
-            nbr = _get_corners_nb(r_corners, kn - 1, jn, in_)
-            az, bz, cz, rz = _newton_in_cell(pos[n], nbr, max_iter)
-            if rz < resid_sq:
-                a, b, c = az, bz, cz;  kn -= 1
-
-        xi_out[n]   = a
-        eta_out[n]  = b
-        zeta_out[n] = c
-        k_out[n]    = kn
-        j_out[n]    = jn
-        i_out[n]    = in_
-
-    return xi_out, eta_out, zeta_out, k_out, j_out, i_out
+    return cart
 
 
-# ── face fluxes ───────────────────────────────────────────────────────────────
+# ── multi-file helpers ────────────────────────────────────────────────────────
 
-def _quad_area_vec(A, B, C, D):
+def _collect_wrf_files(pattern):
     """
-    Area vector of quadrilateral ABCD (traversed in order):
-    0.5 * (C-A) × (D-B)  — half the cross-product of diagonals.
-    Inputs (..., 3) → (..., 3).
+    Glob *pattern*, read XTIME from each file, sort by time.
+
+    Returns
+    -------
+    files    : list[str]          sorted file paths
+    t_sec    : np.ndarray float64  corresponding times in seconds
     """
-    return 0.5 * np.cross(C - A, D - B)
+    files = sorted(_glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f'No files match: {pattern!r}')
+    t_sec = []
+    for f in files:
+        ds = xr.open_dataset(f, decode_times=False)
+        # XTIME is stored in minutes since simulation start
+        xtime_min = float(np.asarray(ds['XTIME'].values).flat[0])
+        t_sec.append(xtime_min * 60.0)
+        ds.close()
+    t_sec = np.array(t_sec, dtype=np.float64)
+    order = np.argsort(t_sec)
+    return [files[i] for i in order], t_sec[order]
 
 
-def _quad_area_mag(A, B, C, D):
-    """Scalar area magnitude from _quad_area_vec."""
-    return np.linalg.norm(_quad_area_vec(A, B, C, D), axis=-1)
-
-
-def _local_up(r):
+def _load_snapshot_fluxes(fname, r_corners):
     """
-    Local radial unit vector (up direction on the sphere) at positions r (..., 3).
+    Open one WRF file and compute face fluxes.
+
+    Returns a flux dict (keys xi_m/xi_p/et_m/et_p/zt_m/zt_p, shape (nz,ny,nx)).
+    Also returns (max_U, max_V, max_W) for CFL estimation.
     """
-    n = np.linalg.norm(r, axis=-1, keepdims=True)
-    return r / np.where(n > 0, n, 1.0)
+    ds = xr.open_dataset(fname)
+    # U is along the grid i direction and V along the grid j direction
+    # (grid-relative, for every MAP_PROJ), i.e. already normal to the
+    # ξ- and η-faces, so no rotation with COSALPHA/SINALPHA is needed.
+    # xarray converts _FillValue/missing_value to NaN; zero them out so
+    # degenerate cells don't corrupt face-flux computation downstream.
+    U = np.nan_to_num(ds['U'][0].values.astype(np.float64), nan=0.0)
+    V = np.nan_to_num(ds['V'][0].values.astype(np.float64), nan=0.0)
+    W = np.nan_to_num(ds['W'][0].values.astype(np.float64), nan=0.0)
+    ds.close()
+    max_uvw = (float(np.nanmax(np.abs(U))),
+               float(np.nanmax(np.abs(V))),
+               float(np.nanmax(np.abs(W))))
+    return compute_face_fluxes(U, V, W, r_corners), max_uvw
 
 
-def compute_face_fluxes(U, V, W, r_corners):
+# ── time-dependent RK4 integrators ───────────────────────────────────────────
+
+def _wrf_integrate_timedep_nb(seeds_ref, t0, dt, nsteps,
+                               fluxes_list, t_snapshots,
+                               r_corners, shape,
+                               frozen=False, verbose=False):
     """
-    Compute face-normal flux φ = velocity · face-area-vector for every cell face.
-
-    U : (nz, ny, nx+1)  grid-relative west-east wind   (m/s)
-    V : (nz, ny+1, nx)  grid-relative south-north wind  (m/s)
-    W : (nz+1, ny, nx)  geometric vertical wind (dz/dt) on W-stagger (m/s)
-    r_corners : (nz+1, ny+1, nx+1, 3)
-
-    For ξ- and η-faces U and V are already the normal components (grid-relative),
-    so φ = velocity × |face area| is exact for orthogonal grids.
-
-    ζ-faces follow the terrain and are tilted over orography, so the horizontal
-    wind crosses them as well as W.  The flux is the full velocity dotted with
-    the face area vector:
-        φ_ζ = (U ê_i + V ê_j + W ê_up) · A_ζ_vec
-    where ê_up is the local radial unit vector, ê_i / ê_j the horizontal unit
-    vectors along the grid i / j directions, and U, V are interpolated to the
-    face centre (mass column, W-level).  Over flat terrain A_ζ_vec ∥ ê_up and
-    this reduces to W × |A_ζ|; over slopes the U, V terms cancel the W = u·∇h
-    of terrain-following flow.  The bottom face is the ground, which is
-    impermeable, so its flux is set to zero.
-
-    Returns dict with keys xi_m, xi_p, et_m, et_p, zt_m, zt_p,
-    each shape (nz, ny, nx).  Units: m³/s.
-    """
-    rc = r_corners
-
-    # ξ-faces: constant i planes, corners span (j, j+1) × (k, k+1)
-    xi_A = rc[:-1, :-1, :]   # (nz, ny, nx+1, 3)
-    xi_B = rc[:-1,  1:, :]
-    xi_C = rc[ 1:,  1:, :]
-    xi_D = rc[ 1:, :-1, :]
-    xi_area = _quad_area_mag(xi_A, xi_B, xi_C, xi_D)   # (nz, ny, nx+1)
-    xi_flux  = U * xi_area
-    flux_xi_m = xi_flux[:, :, :-1]   # (nz, ny, nx)
-    flux_xi_p = xi_flux[:, :,  1:]
-
-    # η-faces: constant j planes, corners span (i, i+1) × (k, k+1)
-    et_A = rc[:-1, :, :-1]   # (nz, ny+1, nx, 3)
-    et_B = rc[:-1, :,  1:]
-    et_C = rc[ 1:, :,  1:]
-    et_D = rc[ 1:, :, :-1]
-    et_area = _quad_area_mag(et_A, et_B, et_C, et_D)   # (nz, ny+1, nx)
-    et_flux  = V * et_area
-    flux_et_m = et_flux[:, :-1, :]   # (nz, ny, nx)
-    flux_et_p = et_flux[:,  1:, :]
-
-    # ζ-faces: constant k surfaces, corners span (i, i+1) × (j, j+1)
-    # Terrain-following, hence tilted: project the full velocity (U, V, W)
-    # onto the face area VECTOR.
-    zt_A = rc[:, :-1, :-1]   # (nz+1, ny, nx, 3)
-    zt_B = rc[:, :-1,  1:]
-    zt_C = rc[:,  1:,  1:]
-    zt_D = rc[:,  1:, :-1]
-    zt_avec = _quad_area_vec(zt_A, zt_B, zt_C, zt_D)   # (nz+1, ny, nx, 3)
-
-    # Local up at face centre (average of 4 corners, then normalise)
-    r_face_centre = 0.25 * (zt_A + zt_B + zt_C + zt_D)   # (nz+1, ny, nx, 3)
-    up = _local_up(r_face_centre)                          # (nz+1, ny, nx, 3)
-
-    def _dot(a, b):
-        return np.einsum('...i,...i->...', a, b)
-
-    # Horizontal unit vectors along the grid i and j directions: the face's
-    # mean edge vectors with the vertical (slope) component removed.
-    def _horizontal_unit(t):
-        t = t - _dot(t, up)[..., None] * up
-        return t / np.linalg.norm(t, axis=-1, keepdims=True)
-    e_i = _horizontal_unit(0.5 * ((zt_B - zt_A) + (zt_C - zt_D)))
-    e_j = _horizontal_unit(0.5 * ((zt_D - zt_A) + (zt_C - zt_B)))
-
-    # U, V at face centres: average to mass columns, then interpolate linearly
-    # in height from the half levels to the W-levels (extrapolate at the top).
-    U_m = 0.5 * (U[:, :, :-1] + U[:, :, 1:])   # (nz, ny, nx)
-    V_m = 0.5 * (V[:, :-1, :] + V[:, 1:, :])
-    dz  = np.diff(np.linalg.norm(r_face_centre, axis=-1), axis=0)   # layer thickness
-    w_below = dz[1:] / (dz[:-1] + dz[1:])      # weight of the half level below
-    U_w = np.zeros_like(W);  V_w = np.zeros_like(W)
-    U_w[1:-1] = w_below * U_m[:-1] + (1 - w_below) * U_m[1:]
-    V_w[1:-1] = w_below * V_m[:-1] + (1 - w_below) * V_m[1:]
-    U_w[-1] = 1.5 * U_m[-1] - 0.5 * U_m[-2]
-    V_w[-1] = 1.5 * V_m[-1] - 0.5 * V_m[-2]
-
-    vel = U_w[..., None] * e_i + V_w[..., None] * e_j + W[..., None] * up
-    zt_flux = _dot(vel, zt_avec)               # (nz+1, ny, nx)
-    zt_flux[0] = 0.0                           # impermeable ground
-    flux_zt_m = zt_flux[:-1, :, :]   # (nz, ny, nx)
-    flux_zt_p = zt_flux[ 1:, :, :]
-
-    return dict(xi_m=flux_xi_m, xi_p=flux_xi_p,
-                et_m=flux_et_m, et_p=flux_et_p,
-                zt_m=flux_zt_m, zt_p=flux_zt_p)
-
-
-# ── mimetic velocity reconstruction ──────────────────────────────────────────
-
-def reconstruct_velocity(xi, eta, zeta, phi, corners):
-    """
-    Mimetic reconstruction of velocity at barycentric position (ξ,η,ζ).
-
-    xi, eta, zeta : (N,)
-    phi           : (N, 6)  [xi_m, xi_p, et_m, et_p, zt_m, zt_p]
-    corners       : (N, 8, 3)
-
-    Returns (N, 3) velocity in m/s.
-    """
-    dxi, det, dzt = _trilinear_derivs(corners, xi, eta, zeta)
-
-    # Einstein summation
-    J = np.einsum('ni,ni->n', dxi, np.cross(det, dzt))   # (N,)
-    # alternatively J = (dxi * np.cross(det, dzt)).sum(axis=-1)
-
-    # Guard against degenerate cells (zero-volume, terrain-following collapse).
-    # Use a threshold relative to the RMS Jacobian so it scales with grid size.
-    J_rms = float(np.sqrt(np.nanmean(J**2))) or 1.0
-    J_safe = np.where(np.abs(J) > 1e-6 * J_rms, J, np.nan)[:, None]  # (N,1)
-
-    a = xi  [:, None];  b = eta[:, None];  c = zeta[:, None]
-
-    u = ((1-a) * phi[:,0:1] * dxi / J_safe
-       +    a  * phi[:,1:2] * dxi / J_safe
-       + (1-b) * phi[:,2:3] * det / J_safe
-       +    b  * phi[:,3:4] * det / J_safe
-       + (1-c) * phi[:,4:5] * dzt / J_safe
-       +    c  * phi[:,5:6] * dzt / J_safe)
-
-    # Replace NaN (degenerate cells) with zero velocity — particle stays put.
-    return np.nan_to_num(u, nan=0.0)
-
-
-# ── cell finding ──────────────────────────────────────────────────────────────
-
-def build_cell_lookup(r_corners):
-    """
-    Build a KD-tree over cell centres.
-    Returns (centres_flat, KDTree, (nz, ny, nx)).
-    """
-    nzp1, nyp1, nxp1 = r_corners.shape[:3]
-    nz, ny, nx = nzp1-1, nyp1-1, nxp1-1
-    centres = 0.125 * (r_corners[:-1,:-1,:-1] + r_corners[:-1,:-1, 1:]
-                     + r_corners[:-1, 1:,:-1] + r_corners[:-1, 1:, 1:]
-                     + r_corners[ 1:,:-1,:-1] + r_corners[ 1:,:-1, 1:]
-                     + r_corners[ 1:, 1:,:-1] + r_corners[ 1:, 1:, 1:])
-    flat = centres.reshape(-1, 3)
-    return flat, cKDTree(flat), (nz, ny, nx)
-
-
-def find_cell_and_bary(pos, kdtree, r_corners, shape,
-                       k_hint=None, j_hint=None, i_hint=None, max_iter=8):
-    """
-    For each particle (N, 3) find cell (k,j,i) and barycentric (ξ,η,ζ).
-
-    If k_hint/j_hint/i_hint are supplied the KD-tree query is skipped and
-    Newton iteration starts from those cell indices.  This is valid whenever
-    the new positions are guaranteed to be close to the hinted cells — i.e.
-    when the CFL condition limits each displacement to a fraction of a cell.
-
-    Without hints a full KD-tree query is performed (needed on the very first
-    call, or as a periodic correction).
+    Numba/Python fallback RK4 in reference space with linear time interpolation.
+    Used when the C++ extension is not available.
     """
     nz, ny, nx = shape
+    rc  = np.ascontiguousarray(r_corners, dtype=np.float64)
+    nz_ = np.int64(nz); ny_ = np.int64(ny); nx_ = np.int64(nx)
+    ts  = np.asarray(t_snapshots, dtype=np.float64)
+    nsnap = len(fluxes_list)
 
-    if k_hint is None:
-        _, idx = kdtree.query(pos)
-        k = np.clip(idx // (ny * nx),        0, nz-1).astype(np.int64)
-        j = np.clip((idx % (ny * nx)) // nx, 0, ny-1).astype(np.int64)
-        i = np.clip(idx % nx,                0, nx-1).astype(np.int64)
-    else:
-        k, j, i = k_hint, j_hint, i_hint
+    farr = [
+        {k: np.ascontiguousarray(v, dtype=np.float64) for k, v in f.items()}
+        for f in fluxes_list
+    ]
 
-    xi, eta, zeta, k, j, i = _newton_bary(
-        np.ascontiguousarray(pos,       dtype=np.float64),
-        k, j, i,
-        np.ascontiguousarray(r_corners, dtype=np.float64),
-        np.int64(nz), np.int64(ny), np.int64(nx),
-        max_iter,
-    )
-    return k, j, i, xi, eta, zeta
+    def _vel_at(pos, t):
+        if frozen or nsnap == 1:
+            f = farr[0]
+        else:
+            idx = int(np.searchsorted(ts, t, side='right')) - 1
+            idx = max(0, min(idx, nsnap - 2))
+            t0s, t1s = ts[idx], ts[idx + 1]
+            alpha = float((t - t0s) / (t1s - t0s)) if t1s > t0s else 0.0
+            alpha = max(0.0, min(1.0, alpha))
+            f0, f1 = farr[idx], farr[idx + 1]
+            f = {k: (1.0 - alpha) * f0[k] + alpha * f1[k] for k in f0}
+        return _ref_velocity_nb(pos,
+                                f['xi_m'], f['xi_p'],
+                                f['et_m'], f['et_p'],
+                                f['zt_m'], f['zt_p'],
+                                rc, nz_, ny_, nx_)
 
-
-def _phi_at(fluxes, k, j, i):
-    """Extract (N, 6) flux array for cells (k[n], j[n], i[n])."""
-    return np.stack([
-        fluxes['xi_m'][k,j,i], fluxes['xi_p'][k,j,i],
-        fluxes['et_m'][k,j,i], fluxes['et_p'][k,j,i],
-        fluxes['zt_m'][k,j,i], fluxes['zt_p'][k,j,i],
-    ], axis=-1)
-
-
-# ── RK4 integrator ────────────────────────────────────────────────────────────
-
-def _velocity_at(pos, kdtree, r_corners, fluxes, shape,
-                 k_hint=None, j_hint=None, i_hint=None):
-    """Return (velocity, k, j, i) so callers can reuse the cell indices."""
-    k, j, i, xi, eta, zeta = find_cell_and_bary(
-        pos, kdtree, r_corners, shape, k_hint, j_hint, i_hint)
-    phi     = _phi_at(fluxes, k, j, i)
-    corners = _get_cell_corners(r_corners, k, j, i)
-    return reconstruct_velocity(xi, eta, zeta, phi, corners), k, j, i
-
-
-def integrate_rk4(seeds, dt, nsteps, kdtree, r_corners, fluxes, shape, verbose=False):
-    """
-    Integrate particle trajectories with RK4.
-
-    seeds  : (N, 3)  initial Cartesian positions (m)
-    dt     : float   time step (s), signed
-    nsteps : int
-
-    Returns (N, 3) final positions.
-
-    KD-tree usage
-    -------------
-    The KD-tree query is called only once — for the very first k1 evaluation.
-    All subsequent cell lookups (k2, k3, k4 within a step, and k1 of every
-    following step) reuse the cell indices from the previous call and skip
-    the KD-tree, going straight to Newton iteration.
-
-    This is valid because the CFL condition guarantees that each sub-step
-    displacement is at most 0.5 × CFL × h ≈ 0.125 h, and each full-step
-    displacement is at most CFL × h = 0.25 h.  Newton converges in one or
-    two iterations when the starting cell is the correct one or a face
-    neighbour, so the warm start is both fast and accurate.
-    """
-    pos = seeds.copy()
-    kc = jc = ic = None   # None → KD-tree on the first call only
-
+    pos = seeds_ref.copy()
+    t = float(t0)
     for step in range(nsteps):
-        if verbose and step % max(1, nsteps//10) == 0:
-            print(f'  RK4 step {step}/{nsteps}')
-
-        # k1 — warm Newton from previous step's cell (KD-tree only on step 0)
-        v1, kc, jc, ic = _velocity_at(pos,              kdtree, r_corners, fluxes, shape,
-                                       kc, jc, ic)
-        # k2, k3, k4 — warm Newton from k1's cell (sub-step displacement ≤ 0.125 h)
-        v2, *_ = _velocity_at(pos + 0.5*dt*v1, kdtree, r_corners, fluxes, shape,
-                               kc, jc, ic)
-        v3, *_ = _velocity_at(pos + 0.5*dt*v2, kdtree, r_corners, fluxes, shape,
-                               kc, jc, ic)
-        v4, *_ = _velocity_at(pos +     dt*v3, kdtree, r_corners, fluxes, shape,
-                               kc, jc, ic)
-
-        pos_new = pos + (dt / 6.0) * (v1 + 2*v2 + 2*v3 + v4)
-        # Freeze any particle whose position became non-finite.
+        if verbose and step % max(1, nsteps // 10) == 0:
+            print(f'  RK4 step {step}/{nsteps}  t={t:.1f} s')
+        v1 = _vel_at(pos,               t)
+        v2 = _vel_at(pos + 0.5*dt*v1,   t + 0.5*dt)
+        v3 = _vel_at(pos + 0.5*dt*v2,   t + 0.5*dt)
+        v4 = _vel_at(pos +     dt*v3,   t +     dt)
+        pos_new = pos + (dt / 6.0) * (v1 + 2.0*v2 + 2.0*v3 + v4)
         bad = ~np.isfinite(pos_new).all(axis=-1)
         pos_new[bad] = pos[bad]
         pos = pos_new
-
+        t += dt
     return pos
 
 
-# ── deformation gradient & FTLE ───────────────────────────────────────────────
-
-def _cell_avg_diff(field):
+def _wrf_integrate_timedep(seeds_ref, t0, dt, nsteps,
+                            fluxes_list, t_snapshots,
+                            r_corners, shape,
+                            frozen=False, verbose=False):
     """
-    Cell-centred average of corner-field differences across each grid direction.
-    field : (nz+1, ny+1, nx+1, 3)
-    Returns (nz, ny, nx, 3) for each of ξ, η, ζ directions.
+    Dispatch to C++ integrator (ftlecpp.integrate_rk4_curvilinear) when
+    available, otherwise fall back to the Numba/Python implementation.
+
+    The C++ version fuses all four RK4 k-evaluations into a single OpenMP
+    parallel loop per step, avoiding repeated fork/join overhead and keeping
+    intermediate positions in registers.
     """
-    dxi  = 0.25*(field[:-1,:-1, 1:]+field[:-1, 1:, 1:]
-                +field[ 1:,:-1, 1:]+field[ 1:, 1:, 1:]
-               -field[:-1,:-1,:-1]-field[:-1, 1:,:-1]
-               -field[ 1:,:-1,:-1]-field[ 1:, 1:,:-1])
-    deta = 0.25*(field[:-1, 1:,:-1]+field[:-1, 1:, 1:]
-                +field[ 1:, 1:,:-1]+field[ 1:, 1:, 1:]
-               -field[:-1,:-1,:-1]-field[:-1,:-1, 1:]
-               -field[ 1:,:-1,:-1]-field[ 1:,:-1, 1:])
-    dzta = 0.25*(field[ 1:,:-1,:-1]+field[ 1:,:-1, 1:]
-                +field[ 1:, 1:,:-1]+field[ 1:, 1:, 1:]
-               -field[:-1,:-1,:-1]-field[:-1,:-1, 1:]
-               -field[:-1, 1:,:-1]-field[:-1, 1:, 1:])
-    return dxi, deta, dzta
+    if _HAVE_CPP:
+        nz, ny, nx = shape
+        nt = len(fluxes_list)
+
+        # Stack per-snapshot fluxes into (nt, nz, ny, nx) float32 arrays
+        def _stack(key):
+            return np.ascontiguousarray(
+                np.stack([f[key] for f in fluxes_list], axis=0), dtype=np.float32)
+
+        fxm = _stack('xi_m'); fxp = _stack('xi_p')
+        fem = _stack('et_m'); fep = _stack('et_p')
+        fzm = _stack('zt_m'); fzp = _stack('zt_p')
+
+        # Flat seeds: [p0..pN, q0..qN, r0..rN]  (seeds are at integer corners
+        # so exact in float32; intermediate positions get float32 arithmetic)
+        N = len(seeds_ref)
+        xyz0 = np.ascontiguousarray(
+            np.concatenate([seeds_ref[:, 0],
+                            seeds_ref[:, 1],
+                            seeds_ref[:, 2]]), dtype=np.float32)
+
+        # Corners stay float64: they are Earth-centred (~6.4e6 m), where float32
+        # resolves only ~0.5 m, too coarse for the Jacobian of thin low layers.
+        rc_f64 = np.ascontiguousarray(r_corners, dtype=np.float64)
+        t_ax   = np.asarray(t_snapshots, dtype=np.float32)
+
+        flat = _ftlecpp.integrate_rk4_curvilinear(
+            xyz0,
+            float(t0), float(dt), nsteps,
+            rc_f64,
+            fxm, fxp, fem, fep, fzm, fzp,
+            t_ax, frozen,
+        )
+
+        # Rebuild (N, 3) float64 for downstream _ref_to_cart_nb
+        return np.stack([flat[:N],
+                         flat[N:2*N],
+                         flat[2*N:]], axis=-1).astype(np.float64)
+
+    # ── Numba fallback ────────────────────────────────────────────────────
+    if verbose:
+        print('  (ftlecpp not available — using Numba fallback)')
+    return _wrf_integrate_timedep_nb(
+        seeds_ref, t0, dt, nsteps,
+        fluxes_list, t_snapshots,
+        r_corners, shape,
+        frozen=frozen, verbose=verbose,
+    )
 
 
-def gradient_curvilinear(Xf, r0):
+# ── coastline helper ──────────────────────────────────────────────────────────
+
+def add_coastlines(pl, resolution='10m', altitude=10_000.0,
+                   color='cyan', line_width=2.0, verbose=False):
     """
-    Cell-centred deformation gradient F from corner displacements.
+    Overlay Natural Earth coastlines on a PyVista plotter whose scene is in
+    ECEF coordinates (metres from Earth's centre).
 
-    Xf : (nz+1, ny+1, nx+1, 3)  final corner positions
-    r0 : (nz+1, ny+1, nx+1, 3)  initial corner positions
-
-    Returns F : (nz, ny, nx, 3, 3)
+    Parameters
+    ----------
+    pl         : pyvista.Plotter
+    resolution : '10m' | '50m' | '110m'  — Natural Earth resolution
+    altitude   : float  — metres above the ellipsoid; must clear terrain
+                          (default 10 km safely above any WRF surface level)
+    color      : PyVista colour spec for the lines
+    line_width : float
+    verbose    : bool
     """
-    disp = Xf - r0
+    import pyvista as pv
+    try:
+        import cartopy.io.shapereader as shpreader
+    except ImportError:
+        import warnings
+        warnings.warn('cartopy not found — coastlines skipped. '
+                      'Install with: pip install cartopy')
+        return
 
-    dr_xi,  dr_et,  dr_zt  = _cell_avg_diff(r0)    # each (nz,ny,nx,3)
-    dd_xi,  dd_et,  dd_zt  = _cell_avg_diff(disp)
+    # WGS-84 parameters
+    a  = 6_378_137.0
+    b  = 6_356_752.3142
+    e2 = 1.0 - (b / a) ** 2
 
-    # Physical-coordinate Jacobian matrix: columns are ∂r/∂ξ, ∂r/∂η, ∂r/∂ζ
-    # Shape (nz, ny, nx, 3, 3)  — last two dims: (physical component, grid dir)
-    dr_mat = np.stack([dr_xi, dr_et, dr_zt], axis=-1)   # (nz,ny,nx,3,3)
-    dd_mat = np.stack([dd_xi, dd_et, dd_zt], axis=-1)
+    def _to_ecef(lon_deg, lat_deg):
+        lo = np.radians(lon_deg)
+        la = np.radians(lat_deg)
+        N  = a / np.sqrt(1.0 - e2 * np.sin(la) ** 2)
+        r  = N + altitude
+        x  = r * np.cos(la) * np.cos(lo)
+        y  = r * np.cos(la) * np.sin(lo)
+        z  = (N * (1.0 - e2) + altitude) * np.sin(la)
+        return np.stack([x, y, z], axis=-1)
 
-    # F - I = dd_mat @ inv(dr_mat)
-    # Solve dr_mat^T @ A^T = dd_mat^T  ↔  A = solve(dr_mat^T, dd_mat^T)^T
-    FmI = np.linalg.solve(
-        dr_mat.swapaxes(-1, -2),
-        dd_mat.swapaxes(-1, -2)
-    ).swapaxes(-1, -2)
-
-    return FmI + np.eye(3)   # broadcast eye over leading dims
-
-
-def compute_ftle(F, tintegr):
-    """
-    FTLE from deformation gradient F : (nz, ny, nx, 3, 3).
-    Returns (nz, ny, nx).
-    """
-    C = np.einsum('...ki,...kj->...ij', F, F)    # C = F^T F
-    lam = np.linalg.eigvalsh(C.reshape(-1, 3, 3))[:, -1]   # max eigenvalue
-    lam = np.maximum(lam, 1e-16).reshape(F.shape[:3])
-    if abs(tintegr) > 1e-12:
-        return np.log(lam) / (2.0 * abs(tintegr))
-    return np.zeros_like(lam)
+    shpfile = shpreader.natural_earth(resolution=resolution,
+                                      category='physical', name='coastline')
+    n_segs = 0
+    for geom in shpreader.Reader(shpfile).geometries():
+        coords = np.array(geom.coords)
+        if len(coords) < 2:
+            continue
+        pts   = _to_ecef(coords[:, 0], coords[:, 1])
+        n     = len(pts)
+        cells = np.empty(3 * (n - 1), dtype=np.int_)
+        cells[0::3] = 2
+        cells[1::3] = np.arange(n - 1)
+        cells[2::3] = np.arange(1, n)
+        seg = pv.PolyData()
+        seg.points = pts
+        seg.lines  = cells
+        pl.add_mesh(seg, color=color, line_width=line_width,
+                    render_lines_as_tubes=False)
+        n_segs += 1
+    if verbose:
+        print(f'Coastlines: {n_segs} segments added at altitude={altitude:.0f} m')
 
 
 # ── main class ────────────────────────────────────────────────────────────────
 
-class WrfFtle:
+class WrfFtle(FtleBase):
+    """
+    FTLE computation using reference-space (index-space) integration over
+    multiple WRF output files.
+
+    wrffiles     : glob pattern matching the WRF files (e.g. 'wrf_f*.nc')
+    time_index   : index into the time-sorted file list for the reference snapshot
+    frozen       : if True, velocity is fixed at the reference snapshot
+    """
 
     def __init__(self):
-        self.wrffile      = ""
-        self.tintegr      = -3600.0   # seconds (negative = backward)
-        self.cfl          = 0.25
-        self.time_index   = 0
-        self.imin         = None      # seed sub-region (cell indices, None = full domain)
-        self.imax         = None
-        self.jmin         = None
-        self.jmax         = None
-        self.checksum     = False
-        self.cmax         = None      # colour scale max (min fixed at 0); None = data-driven
-        self.verbose      = False
+        super().__init__()            # tintegr, cfl, time_index, imin/imax/jmin/jmax,
+                                      # checksum, cmax, verbose from FtleBase
+        self.wrffiles     = ""
+        self.frozen       = False     # if True, fix velocity at reference snapshot
 
     def compute(self):
-        t0 = time.perf_counter()
-        ds = xr.open_dataset(self.wrffile)
-        ti = self.time_index
+        t0_wall = time.perf_counter()
 
-        # ── grid ─────────────────────────────────────────────────────────
-        lats = ds['XLAT' ][ti].values          # (ny, nx)
-        lons = ds['XLONG'][ti].values
-        ph   = ds['PH' ][ti].values            # (nz+1, ny, nx) perturbation geopotential
-        phb  = ds['PHB'][ti].values            # base geopotential
-        heights_w = (ph + phb) / 9.81          # geopotential height at W-levels (m)
+        # ── collect and sort all matching files ───────────────────────────
+        all_files, t_all_s = _collect_wrf_files(self.wrffiles)
+        nt_all = len(all_files)
 
-        # ── winds ─────────────────────────────────────────────────────────
-        # U is along the grid i direction and V along the grid j direction
-        # (grid-relative, for every MAP_PROJ), i.e. already normal to the
-        # ξ- and η-faces, so no rotation with COSALPHA/SINALPHA is needed.
-        # xarray converts _FillValue/missing_value to NaN; zero them out so
-        # degenerate cells don't corrupt face-flux computation downstream.
-        U = np.nan_to_num(ds['U'][ti].values.astype(np.float64), nan=0.0)  # (nz, ny, nx+1)
-        V = np.nan_to_num(ds['V'][ti].values.astype(np.float64), nan=0.0)  # (nz, ny+1, nx)
-        W = np.nan_to_num(ds['W'][ti].values.astype(np.float64), nan=0.0)  # (nz+1, ny, nx)
+        if self.verbose:
+            print(f'Found {nt_all} file(s) matching {self.wrffiles!r}')
+            for fname, ts in zip(all_files, t_all_s):
+                import os
+                print(f'  {os.path.basename(fname)}  t={ts:.1f} s')
 
-        t1 = time.perf_counter()
+        # ── reference snapshot ────────────────────────────────────────────
+        ti = self.time_index if self.time_index >= 0 else nt_all + self.time_index
+        if not (0 <= ti < nt_all):
+            raise IndexError(
+                f'time_index={self.time_index} out of range for {nt_all} file(s)')
+        t_val = t_all_s[ti]
 
-        # ── corner positions ──────────────────────────────────────────────
+        if self.verbose:
+            import os
+            print(f'Reference snapshot: index={ti}  t={t_val:.1f} s  '
+                  f'({os.path.basename(all_files[ti])})')
+
+        # ── select files that cover the integration window ────────────────
+        if self.frozen:
+            sel_indices = [ti]
+            t_snapshots = np.array([t_val])
+            if self.verbose:
+                print('Mode: frozen (velocity fixed at reference snapshot)')
+        else:
+            if nt_all < 2:
+                raise ValueError(
+                    'Time-dependent integration requires at least 2 files; '
+                    'use --frozen instead.')
+            t_end = t_val + self.tintegr
+            tmin  = min(t_val, t_end)
+            tmax  = max(t_val, t_end)
+            # Outside the snapshots the time interpolation would clamp, i.e.
+            # silently freeze the flow at the first/last file.
+            if tmin < t_all_s[0] or tmax > t_all_s[-1]:
+                raise ValueError(
+                    f'Integration window [{tmin:.0f}, {tmax:.0f}] s extends beyond '
+                    f'the files [{t_all_s[0]:.0f}, {t_all_s[-1]:.0f}] s; choose '
+                    f'another --time-index/--tintegr or use --frozen.')
+            in_win = np.where((t_all_s >= tmin) & (t_all_s <= tmax))[0]
+            if len(in_win) == 0:
+                raise ValueError(
+                    f'No files in time window [{tmin:.0f}, {tmax:.0f}] s.  '
+                    f'Available times: {t_all_s}')
+            # Extend by one file on each side to allow interpolation at boundary
+            i0 = max(0, int(in_win[0]) - 1)
+            i1 = min(nt_all - 1, int(in_win[-1]) + 1)
+            sel_indices = list(range(i0, i1 + 1))
+            t_snapshots = t_all_s[sel_indices]
+            if self.verbose:
+                print(f'Time window: [{tmin:.1f}, {tmax:.1f}] s  '
+                      f'loading {len(sel_indices)} snapshot(s)  '
+                      f'(t={t_snapshots[0]:.1f}–{t_snapshots[-1]:.1f} s)')
+
+        # ── grid geometry (static across files) ──────────────────────────
+        ds_ref = xr.open_dataset(all_files[ti])
+
+        lats      = ds_ref['XLAT' ][0].values      # (ny, nx)
+        lons      = ds_ref['XLONG'][0].values
+        ph        = ds_ref['PH'   ][0].values
+        phb       = ds_ref['PHB'  ][0].values
+        ds_ref.close()
+
+        heights_w = (ph + phb) / 9.81
         r_corners = build_corner_positions(lats, lons, heights_w)
         nzp1, nyp1, nxp1 = r_corners.shape[:3]
         nz, ny, nx = nzp1-1, nyp1-1, nxp1-1
+        shape = (nz, ny, nx)
         if self.verbose:
-            print(f'Cells: {nz}×{ny}×{nx}   corners: {nzp1}×{nyp1}×{nxp1}')
+            print(f'Cells: {nz}×{ny}×{nx}')
 
-        # ── face fluxes & lookup ──────────────────────────────────────────
-        fluxes = compute_face_fluxes(U, V, W, r_corners)
-        _, kdtree, shape = build_cell_lookup(r_corners)
+        # ── load face fluxes for each selected snapshot ───────────────────
+        fluxes_list = []
+        max_uvws = []
+        for i in sel_indices:
+            fluxes, uvw = _load_snapshot_fluxes(all_files[i], r_corners)
+            fluxes_list.append(fluxes)
+            max_uvws.append(uvw)
 
-        t2 = time.perf_counter()
+        t1_wall = time.perf_counter()
 
-        # ── seed at corner nodes (optionally restricted to sub-region) ───────
-        imin = self.imin if self.imin is not None else 0
-        imax = self.imax if self.imax is not None else nx - 1
-        jmin = self.jmin if self.jmin is not None else 0
-        jmax = self.jmax if self.jmax is not None else ny - 1
-        # Support Python-style negative indices (e.g. --imax=-100 → nx-100)
-        if imin < 0: imin = nx + imin
-        if imax < 0: imax = nx + imax
-        if jmin < 0: jmin = ny + jmin
-        if jmax < 0: jmax = ny + jmax
-        imin = max(0, min(imin, nx - 1))
-        imax = max(0, min(imax, nx - 1))
-        jmin = max(0, min(jmin, ny - 1))
-        jmax = max(0, min(jmax, ny - 1))
-        # corners: need imax+2, jmax+2 to include all corners bounding cells [imin..imax]
-        rc_seed = r_corners[:, jmin:jmax+2, imin:imax+2, :]
-        seeds = rc_seed.reshape(-1, 3)
-        N = len(seeds)
+        # ── seed sub-region ───────────────────────────────────────────────
+        imin, imax, jmin, jmax = FtleBase._resolve_indices(
+            self.imin, self.imax, self.jmin, self.jmax, nx, ny)
+
+        ip = np.arange(imin,  imax + 2, dtype=np.float64)   # nxp1_seed
+        jp = np.arange(jmin,  jmax + 2, dtype=np.float64)   # nyp1_seed
+        kp = np.arange(nzp1,            dtype=np.float64)   # nzp1
+
+        seeds_ref = np.stack(
+            np.broadcast_arrays(
+                ip[np.newaxis, np.newaxis, :],
+                jp[np.newaxis, :, np.newaxis],
+                kp[:, np.newaxis, np.newaxis],
+            ), axis=-1
+        ).reshape(-1, 3).astype(np.float64)
+
         if self.verbose:
-            print(f'Seed region: i=[{imin},{imax}] j=[{jmin},{jmax}]  seed points: {N}')
+            print(f'Seed region: i=[{imin},{imax}] j=[{jmin},{jmax}]  '
+                  f'seed points: {len(seeds_ref)}')
 
-        # CFL-based step count.
-        # Use the 5th-percentile cell edge length (not the minimum) so that a
-        # handful of degenerate near-surface cells do not dominate the step count.
-        max_spd = max(float(np.nanmax(np.abs(U))),
-                      float(np.nanmax(np.abs(V))),
-                      float(np.nanmax(np.abs(W))))
-        edge_xi  = np.linalg.norm(r_corners[:-1,:-1, 1:] - r_corners[:-1,:-1,:-1], axis=-1)
-        edge_eta = np.linalg.norm(r_corners[:-1, 1:,:-1] - r_corners[:-1,:-1,:-1], axis=-1)
-        edge_zta = np.linalg.norm(r_corners[ 1:,:-1,:-1] - r_corners[:-1,:-1,:-1], axis=-1)
-        h_rep = float(np.percentile(np.concatenate([edge_xi.ravel(),
-                                                    edge_eta.ravel(),
-                                                    edge_zta.ravel()]), 5))
-        h_rep = max(h_rep, 1.0)
-        nsteps = max(int(max_spd * abs(self.tintegr) / h_rep / self.cfl) + 1, 20)
+        # ── CFL step count ─────────────────────────────────────────────────
+        # Per-direction edge lengths (5th percentile keeps outliers from
+        # over-constraining; floor at 1 m avoids division by zero)
+        edge_xi  = np.linalg.norm(r_corners[:-1, :-1,  1:] - r_corners[:-1, :-1, :-1], axis=-1)
+        edge_eta = np.linalg.norm(r_corners[:-1,  1:, :-1] - r_corners[:-1, :-1, :-1], axis=-1)
+        edge_zta = np.linalg.norm(r_corners[ 1:, :-1, :-1] - r_corners[:-1, :-1, :-1], axis=-1)
+        h_xi  = max(float(np.percentile(edge_xi.ravel(),  5)), 1.0)
+        h_eta = max(float(np.percentile(edge_eta.ravel(), 5)), 1.0)
+        h_zta = max(float(np.percentile(edge_zta.ravel(), 5)), 1.0)
+        # Per-component wind maxima across all loaded snapshots
+        max_U = max(uvw[0] for uvw in max_uvws)
+        max_V = max(uvw[1] for uvw in max_uvws)
+        max_W = max(uvw[2] for uvw in max_uvws)
+        # Each direction contributes independently to the step count
+        nsteps = max(
+            int(max_U * abs(self.tintegr) / h_xi  / self.cfl) + 1,
+            int(max_V * abs(self.tintegr) / h_eta / self.cfl) + 1,
+            int(max_W * abs(self.tintegr) / h_zta / self.cfl) + 1,
+            20)
         dt = self.tintegr / nsteps
         if self.verbose:
-            print(f'max_speed={max_spd:.2f} m/s  h_5pct={h_rep:.0f} m  '
+            print(f'max_U={max_U:.2f} max_V={max_V:.2f} max_W={max_W:.2f} m/s  '
+                  f'h_xi={h_xi:.0f} h_eta={h_eta:.0f} h_zta={h_zta:.0f} m  '
                   f'nsteps={nsteps}  dt={dt:.4f} s')
 
-        t3 = time.perf_counter()
+        t2_wall = time.perf_counter()
 
-        # ── integrate ─────────────────────────────────────────────────────
-        final = integrate_rk4(seeds, dt, nsteps, kdtree, r_corners,
-                               fluxes, shape, verbose=self.verbose)
+        # ── RK4 integration in reference space ───────────────────────────
+        final_ref = _wrf_integrate_timedep(
+            seeds_ref, t_val, dt, nsteps,
+            fluxes_list, t_snapshots,
+            r_corners, shape,
+            frozen=self.frozen,
+            verbose=self.verbose,
+        )
 
-        t4 = time.perf_counter()
+        t3_wall = time.perf_counter()
 
-        # ── FTLE ──────────────────────────────────────────────────────────
-        seed_shape = rc_seed.shape[:3]   # (nz+1, jmax-jmin+2, imax-imin+2)
-        Xf   = final.reshape(*seed_shape, 3)
+        # ── convert final reference → Cartesian, then FTLE ───────────────
+        nyp1s = jmax - jmin + 2
+        nxp1s = imax - imin + 2
+        rc_seed = r_corners[:, jmin:jmax+2, imin:imax+2, :]
+
+        Xf = _ref_to_cart_nb(
+            np.ascontiguousarray(final_ref, dtype=np.float64),
+            np.ascontiguousarray(r_corners, dtype=np.float64),
+            np.int64(nz), np.int64(ny), np.int64(nx),
+        ).reshape(nzp1, nyp1s, nxp1s, 3)
+
         F    = gradient_curvilinear(Xf, rc_seed)
         ftle = compute_ftle(F, self.tintegr)
 
-        t5 = time.perf_counter()
+        t4_wall = time.perf_counter()
 
         if self.verbose:
-            print(f'Read {t1-t0:.2f}s  Build {t2-t1:.2f}s  '
-                  f'Setup {t3-t2:.2f}s  RK4 {t4-t3:.2f}s  FTLE {t5-t4:.2f}s')
+            print(f'Load {t1_wall-t0_wall:.2f}s  Setup {t2_wall-t1_wall:.2f}s  '
+                  f'RK4 {t3_wall-t2_wall:.2f}s  FTLE {t4_wall-t3_wall:.2f}s')
+
+        result = dict(r_corners=rc_seed, ftle=ftle)
 
         if self.checksum:
-            import hashlib
-            def _cksum(arr, name):
-                # Stable byte-level checksum (little-endian float64) + simple stats
-                b = np.ascontiguousarray(arr, dtype=np.float64).tobytes()
-                md5 = hashlib.md5(b).hexdigest()
-                fin = arr[np.isfinite(arr)]
-                print(f'  {name:20s}  shape={arr.shape}  '
-                      f'min={fin.min():.6g}  max={fin.max():.6g}  '
-                      f'mean={fin.mean():.6g}  md5={md5}')
-            print('── checksum ──────────────────────────────────────────────')
-            _cksum(rc_seed, 'r_corners')
-            _cksum(ftle,    'ftle')
-            print('──────────────────────────────────────────────────────────')
+            self._print_checksum(result)
 
-        return dict(r_corners=rc_seed, ftle=ftle)
+        return result
 
+    # _print_checksum() inherited from FtleBase.
     def visualise(self, result, level=0, cmax=None):
         """
-        Interactive level viewer.
+        Interactive level viewer with a top-down (nadir) camera.
+
+        WRF corners are in Earth-centred Cartesian (ECEF) coordinates, so the
+        correct "looking down" direction is the local radial unit vector at the
+        domain centroid — not the global Z axis used by PyVista's view_xy().
 
         Press 'z' / 'Z' to step down / up through vertical levels.
-
-        level : int    starting k-index (0 = bottom; negative counts from top)
-        cmax  : float  colour scale maximum (min fixed at 0); None = data-driven
         """
         import pyvista as pv
-        rc   = result['r_corners']
-        ftle = result['ftle']
+
+        rc   = result['r_corners']   # (nzp1, nyp1, nxp1, 3)
+        ftle = result['ftle']        # (nz,   ny,   nx)
         nzp1, nyp1, nxp1 = rc.shape[:3]
         nz = nzp1 - 1
-
         clim = [0.0, float(cmax)] if cmax is not None else None
 
         def make_grid(k):
@@ -867,7 +624,6 @@ class WrfFtle:
             return g
 
         state = {'k': int(level) % nz}
-
         pl = pv.Plotter()
 
         def refresh():
@@ -890,17 +646,46 @@ class WrfFtle:
         pl.add_key_event('z', step_down)
         pl.add_key_event('Z', step_up)
         refresh()
+
+        # ── nadir camera: look straight down at the domain ────────────────
+        # Centroid of the bottom seed level gives the domain centre in ECEF.
+        pts      = rc[0].reshape(-1, 3)
+        centroid = pts.mean(axis=0)
+        radial   = centroid / np.linalg.norm(centroid)   # local "up" (away from Earth)
+
+        # Domain half-diagonal in the tangent plane — the camera height is
+        # scaled to this so the whole domain fills the view regardless of
+        # resolution or location.
+        diff   = pts - centroid
+        tang   = diff - (diff @ radial)[:, np.newaxis] * radial  # project out radial
+        domain_radius = float(np.linalg.norm(tang, axis=1).max())
+        # 1.5× half-diagonal ≈ fits the domain with a small margin
+        height = max(domain_radius * 3.0, 1e3)   # at least 1 km above surface
+        eye    = centroid + radial * height
+
+        # "North" in the image: project global Z onto the tangent plane;
+        # fall back to global Y if too close to a pole.
+        gz     = np.array([0.0, 0.0, 1.0])
+        cam_up = gz - np.dot(gz, radial) * radial
+        if np.linalg.norm(cam_up) < 1e-6:
+            cam_up = np.array([0.0, 1.0, 0.0])
+        cam_up /= np.linalg.norm(cam_up)
+        pl.camera.position    = eye.tolist()
+        pl.camera.focal_point = centroid.tolist()
+        pl.camera.up          = cam_up.tolist()
+
+        add_coastlines(pl, verbose=self.verbose)
         pl.show()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
+def main(*, wrffiles, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
          time_index=0, imin=None, imax=None, jmin=None,
          jmax=None, checksum=False, visualise=False, level=0, cmax=None,
-         verbose=False):
+         frozen=False, verbose=False):
     wf = WrfFtle()
-    wf.wrffile       = wrffile
+    wf.wrffiles      = wrffiles
     wf.tintegr       = tintegr
     wf.cfl           = cfl
     wf.time_index    = time_index
@@ -910,6 +695,7 @@ def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     wf.jmax          = jmax
     wf.checksum      = checksum
     wf.cmax          = cmax
+    wf.frozen        = frozen
     wf.verbose       = verbose
 
     result = wf.compute()
@@ -917,7 +703,6 @@ def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
     if visualise:
         wf.visualise(result, level=level, cmax=cmax)
 
-    # Write full 3-D VTK StructuredGrid
     import pyvista as pv
     rc   = result['r_corners']
     ftle = result['ftle']
@@ -933,41 +718,42 @@ def main(*, wrffile, vtkout='wrf_ftle.vts', tintegr=-3600.0, cfl=0.25,
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description='Compute FTLE from WRF output using mimetic velocity reconstruction.')
-    p.add_argument('wrffile')
-    p.add_argument('--vtkout',        default='wrf_ftle.vts')
-    p.add_argument('--tintegr',       type=float, default=-3600.0,
-                   help='Integration time in seconds (negative=backward)')
-    p.add_argument('--cfl',           type=float, default=0.25, help='CFL number for RK4 step count (default: 0.25)')
-    p.add_argument('--time-index',    type=int,   default=0, help='Time index in WRF file (default: 0)')
-    p.add_argument('--imin',          type=int, default=200,
-                   help='First i cell index for seed region (default: 200)')
-    p.add_argument('--imax',          type=int, default=220,
-                   help='Last i cell index for seed region (default: 220)')
-    p.add_argument('--jmin',          type=int, default=300,
-                   help='First j cell index for seed region (default: 300)')
-    p.add_argument('--jmax',          type=int, default=320,
-                   help='Last j cell index for seed region (default: 320)')
-    p.add_argument('--checksum',       action='store_true',
-                   help='Print MD5 + stats for r_corners and ftle (reproducibility check)')
-    p.add_argument('--visualise',      action='store_true')
-    p.add_argument('--level',          type=int, default=0,
-                   help='Starting vertical level (k index) for visualisation '
-                        '(default: 0 = bottom; negative counts from top)')
-    p.add_argument('--cmax',           type=float, default=None,
-                   help='Colour scale maximum for FTLE (min fixed at 0); '
-                        'default: data-driven per frame')
-    p.add_argument('--verbose',        action='store_true')
+        description='WRF FTLE – reference-space (index) integration, '
+                    'multi-file time-dependent velocity.')
+    p.add_argument('wrffiles',
+                   help='Glob pattern for WRF output files (e.g. "wrf_f*.nc"). '
+                        'Files are sorted by XTIME; --time-index selects the '
+                        'reference snapshot.')
+    # frozen / time-dependent
+    grp2 = p.add_mutually_exclusive_group()
+    grp2.add_argument('--frozen', dest='frozen', action='store_true',
+                      help='Fix velocity at the reference snapshot (faster, '
+                           'single file read).')
+    grp2.add_argument('--no-frozen', dest='frozen', action='store_false',
+                      help='Interpolate velocity in time across the integration '
+                           'window (default).')
+    p.set_defaults(frozen=False)
+    # shared flags
+    FtleBase.add_common_args(p, default_vtkout='wrf_ftle.vts',
+                                default_tintegr=-3600.0)
     return p
 
 
 def cli():
     args = build_parser().parse_args()
-    main(wrffile=args.wrffile, vtkout=args.vtkout, tintegr=args.tintegr,
-         cfl=args.cfl, time_index=args.time_index,
-         imin=args.imin, imax=args.imax, jmin=args.jmin, jmax=args.jmax,
-         checksum=args.checksum, visualise=args.visualise,
-         level=args.level, cmax=args.cmax, verbose=args.verbose)
+    main(wrffiles=args.wrffiles,
+         vtkout=args.vtkout,
+         tintegr=args.tintegr,
+         cfl=args.cfl,
+         time_index=args.time_index,
+         imin=args.imin, imax=args.imax,
+         jmin=args.jmin, jmax=args.jmax,
+         checksum=args.checksum,
+         visualise=args.visualise,
+         level=args.level,
+         cmax=args.cmax,
+         frozen=args.frozen,
+         verbose=args.verbose)
 
 
 if __name__ == '__main__':
