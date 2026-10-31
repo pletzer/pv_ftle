@@ -37,7 +37,11 @@ both converging to the same field, with the first-order error dominating at
 WRF's native \SI{3.3}{km} resolution. An independent integration with
 NumbaCS-3D (cubic splines, adaptive DOP853) agrees with the second-order
 result two to three times better than with the first-order one, and shows
-none of the first-order holes.
+none of the first-order holes. Against exact trajectories of an analytic
+divergence-free wind on WRF-like stretched layers, the second-order
+reconstruction is the most accurate of the methods that use the face fluxes:
+at \SI{1.25}{km} its median FTLE error is 0.004\%, against 0.04\% for NumbaCS on
+destaggered data and 0.2\% for order 1.
 \end{abstract}
 
 \section{Introduction}
@@ -430,6 +434,90 @@ $\mathrm{FTLE}<\mathrm{FTLE}_\text{cubic}/4$ make up 1.5\% of cells at order 1
 small-scale and of both signs, mostly along FTLE filaments over the mountains,
 where the two interpolations of the unresolved small scales differ.
 
+\section{Analytic benchmark}
+
+Agreement between methods does not tell which is accurate: the two NumbaCS
+interpolants agree closely on the WRF case partly because they interpolate
+the \emph{same} node values, which come from destaggering the face fluxes. To
+rank the methods, all of them were run on an analytic wind whose exact
+trajectories are known (\texttt{scripts/bench\_analytic.py}).
+
+\paragraph{Setup.} A box of $240\times240\times\SI{10}{km}$ with WRF-like
+stretched layers $z(s)=H\,(e^{4s}-1)/(e^4-1)$ at three nested resolutions:
+$\Delta x=5$, 2.5 and \SI{1.25}{km} with 10, 20 and 40 layers (bottom layer
+92, 41 and \SI{20}{m}). The steady wind is divergence-free (to $10^{-12}$) with
+$w=0$ on the ground and the lid: a boundary-layer shear profile
+$U(z)=6(1-e^{-z/\SI{400}{m}})+4z/H$, two convective rolls (in $x$--$z$ and
+$y$--$z$, $|w|$ up to \SI{0.6}{m/s}) and horizontal vortices; speeds reach
+\SI{16}{m/s}. Face fluxes are integrated exactly ($4\times4$ Gauss), so the
+discrete data are exact. Seeds are the corners of the coarsest grid over the
+central \SI{120}{km} on all its 11 levels (6875 seeds, on cell faces at every
+resolution); $T=\SI{-3600}{s}$ (median displacement \SI{22}{km}). Exact
+trajectories use RK4 with $\Delta t=\SI{1}{s}$ (converged to $10^{-8}$\,m);
+\texttt{wrf\_ftle} uses 400 steps; NumbaCS uses DOP853. NumbaCS is given either
+the destaggered node data, built from the face fluxes exactly as for WRF, or
+the exact analytic velocity at its nodes --- the best input it could have, but
+not one available from WRF output. FTLE errors are relative to the 99th
+percentile of the exact FTLE.
+
+\begin{table}[t]
+  \centering
+  \caption{Errors against the exact solution at the three resolutions:
+  median final-position error of ground seeds and of seeds on levels $\ge4$,
+  and median FTLE error relative to $S$.}
+  \label{tab:bench}
+  \small
+  \begin{tabular}{lrrrrrrrrr}
+    \toprule
+     & \multicolumn{3}{c}{ground seeds (m)} & \multicolumn{3}{c}{levels $\ge4$ (m)} & \multicolumn{3}{c}{FTLE error / $S$ (\%)} \\
+    \cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+    $\Delta x$ (km) & 5 & 2.5 & 1.25 & 5 & 2.5 & 1.25 & 5 & 2.5 & 1.25 \\
+    \midrule
+    order 1                         & 2331 & 1057 & 507  & 768 & 250 & 84  & 1.75 & 0.64 & 0.22 \\
+    order 2                         & 103  & 34   & 9.1  & 60  & 8.5 & 1.4 & 0.17 & 0.020 & 0.0038 \\
+    NumbaCS cubic, destaggered      & 339  & 85   & 21   & 330 & 84  & 21  & 0.67 & 0.17 & 0.042 \\
+    NumbaCS linear, destaggered     & 676  & 171  & 42   & 591 & 153 & 38  & 0.93 & 0.25 & 0.063 \\
+    \midrule
+    NumbaCS cubic, exact nodes      & 1.3  & 0.07 & 0.005 & 33 & 8.4 & 2.2 & 0.038 & 0.0088 & 0.0021 \\
+    NumbaCS linear, exact nodes     & 350  & 86   & 21   & 296 & 74  & 18  & 0.28 & 0.076 & 0.020 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{bench_convergence}
+  \caption{Errors against the exact solution versus grid spacing. Grey:
+  slopes $\propto\Delta x$ and $\propto\Delta x^2$.}
+  \label{fig:bench}
+\end{figure}
+
+\paragraph{Results.} (Table~\ref{tab:bench}, Fig.~\ref{fig:bench}.)
+\begin{itemize}
+  \item \emph{Order 1} converges at first order near the ground (errors halve per
+  refinement) and somewhat faster above; it has the largest errors at every
+  resolution and 2.3\% holes on the coarsest grid.
+  \item \emph{Order 2} converges at second order or better: ground errors fall
+  by $3$--$4\times$ per refinement, errors above the ground by $6$--$7\times$ and
+  FTLE errors by $5$--$8\times$. At \SI{1.25}{km} it is 55 times more accurate
+  than order 1 at the ground and 60 times in FTLE.
+  \item \emph{NumbaCS on destaggered data} converges at second order
+  (errors fall $4\times$ per refinement), but the destaggering step limits it:
+  at every resolution its errors are 3--15 times larger than order 2's, with
+  the cubic spline about twice as accurate as the linear interpolant. This is
+  why the two NumbaCS runs agree with each other on WRF yet both differ from
+  order 2: they share the destaggering error.
+  \item \emph{NumbaCS on exact nodes} is the most accurate at the ground, where
+  the exact nodal wind is smooth in height, and its FTLE errors are about half
+  of order 2's. Above the ground its position errors are comparable to order 2's
+  (equal at \SI{2.5}{km}, larger at \SI{1.25}{km}). Such nodal data are not
+  available from WRF, which provides face fluxes.
+\end{itemize}
+Of the methods that can be fed WRF's face fluxes, order 2 is therefore the
+most accurate. The benchmark wind is smooth and well resolved (scales of
+45--\SI{70}{km}); in WRF output with under-resolved small scales all methods
+lose accuracy, and the margins will be smaller.
+
 \section{Conclusions}
 
 \begin{enumerate}
@@ -453,7 +541,11 @@ where the two interpolations of the unresolved small scales differ.
   1--2\%, but individual first-order cells can be wrong by 100\%.
   \item \textbf{Independent check.} NumbaCS-3D (cubic splines, DOP853) agrees
   with order 2 two to three times better than with order 1 and has none of
-  the first-order holes, so the second-order result is the more accurate one.
+  the first-order holes. Against exact trajectories of an analytic wind on
+  WRF-like stretched layers, order 2 converges at second order or better and is
+  the most accurate of the methods that use the face fluxes: 10 times more
+  accurate in FTLE than NumbaCS on destaggered data and 60 times more than
+  order 1 at \SI{1.25}{km}.
   \item \textbf{Recommendation.} Use order 2 (the default). Treat first-order
   FTLE in the lowest layer and in thick upper layers with caution, especially
   where the vertical velocity changes sign across a layer. The extra cost of
@@ -478,8 +570,17 @@ NUMBACS3D/venv/bin/python scripts/numbacs_compare_run.py \
 python scripts/numbacs_compare_analyse.py WRF_DIR export.npz \
        numbacs.npz report/order2/figures
 \end{verbatim}
+Analytic benchmark (stage 2 for each \texttt{<res>} in c, m, f and
+\texttt{<variant>} in destag, exact):
+\begin{verbatim}
+python scripts/bench_analytic.py prepare BENCH_DIR
+NUMBACS3D/venv/bin/python scripts/numbacs_compare_run.py NUMBACS3D \
+       BENCH_DIR/numbacs_in_<res>_<variant>.npz \
+       BENCH_DIR/numbacs_out_<res>_<variant>.npz
+python scripts/bench_analytic.py analyse BENCH_DIR report/order2/figures
+\end{verbatim}
 {\sloppy
 \texttt{WRF\_DIR} holds \texttt{wrf\_f004.nc} and \texttt{wrf\_f005.nc}.
-Numbers quoted in the text are in \texttt{figures/stats.json} and \texttt{figures/numbacs\_stats.json}.\par}
+Numbers quoted in the text are in \texttt{figures/stats.json}, \texttt{figures/numbacs\_stats.json} and \texttt{figures/bench\_stats.json}.\par}
 
 \end{document}
