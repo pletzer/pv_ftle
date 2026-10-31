@@ -1,0 +1,609 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage[font=small]{caption}
+\graphicspath{{figures/}}
+
+\title{First- versus second-order mimetic velocity reconstruction\\
+       in \texttt{wrf\_ftle}: where the FTLE differs and why}
+\author{pv\_ftle --- branch \texttt{2ndorder}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The first-order (lowest-order Raviart--Thomas) and second-order ($Q_{2,1,1}$)
+velocity reconstructions of \texttt{wrf\_ftle} were compared on WRF output over
+the Transantarctic Mountains and the Ross Ice Shelf ($2.3\times10^6$ seeds,
+$T=\SI{-1}{h}$). Over most of the domain the two FTLE fields agree closely
+(median difference 2\% of the FTLE scale) and the differences are unbiased,
+largest along sharp FTLE ridges. The exception is a predictable, systematic
+first-order artefact: in cells into which the (time-reversed) vertical flow
+converges, both seeds bounding the cell are drawn into the same layer, where
+the first-order wind is constant with height, so they do not separate and the
+first-order FTLE collapses. This affects the ground layer most (first-order FTLE
+25\% lower on average, holes in 15\% of its cells) and the thick upper layers.
+The differences between the orders are 100--1000 times larger than the
+time-stepping error, so they come from the reconstruction. Coarsening the data
+by 2 and 4 shows the difference between the orders shrinking roughly in
+proportion to the grid spacing, and the second-order FTLE changing about three
+times less than the first-order one under coarsening: the evidence points to
+both converging to the same field, with the first-order error dominating at
+WRF's native \SI{3.3}{km} resolution. An independent integration with
+NumbaCS-3D (cubic splines, adaptive DOP853) agrees with the second-order
+result two to three times better than with the first-order one, and shows
+none of the first-order holes. Against exact trajectories of an analytic
+divergence-free wind on WRF-like stretched layers, the second-order
+reconstruction is the most accurate of the methods that use the face fluxes:
+at \SI{1.25}{km} its median FTLE error is 0.004\%, against 0.04\% for NumbaCS on
+destaggered data and 0.2\% for order 1.
+\end{abstract}
+
+\section{Introduction}
+
+\texttt{wrf\_ftle} advects particles in index space $(p,q,r)=(i+\xi,\,j+\eta,\,k+\zeta)$
+with a mimetic velocity reconstruction built from the WRF face fluxes, and
+computes the finite-time Lyapunov exponent (FTLE) from the flow map.
+Two reconstructions are available (\texttt{--order 1|2}).
+This report compares them on WRF output over the Ross Ice Shelf and the
+Transantarctic Mountains, asking three questions:
+\begin{enumerate}
+  \item Where do first- and second-order FTLE fields differ?
+  \item Are the differences predictable from properties of the flow or grid?
+  \item Do the two converge to the same FTLE field as the grid is refined?
+\end{enumerate}
+
+\section{The two reconstructions}
+
+In a cell, the velocity in index space is
+$\dot\xi = F_\xi/J$ (likewise for $\eta,\zeta$), where $J$ is the Jacobian of
+the trilinear map and $F_\xi$ the flux density through surfaces of constant $\xi$.
+The face data are the face-mean normal velocity $w=\phi/A$ (flux over area)
+and the face area $A$.
+
+\paragraph{Order 1} (lowest-order Raviart--Thomas): $F_\xi$ varies linearly
+between the two $\xi$-faces of the cell and is constant over each face,
+\begin{equation}
+  F_\xi = (1-\xi)\,A_0w_0 + \xi\,A_1w_1 .
+\end{equation}
+The normal component is continuous across faces, but the tangential
+components are piecewise constant: they \emph{jump} across every face. In
+particular, the horizontal wind is constant with height inside each layer.
+
+\paragraph{Order 2} ($Q_{2,1,1}$): $F_\xi$ is quadratic between the faces and
+linear along each face,
+\begin{equation}
+  F_\xi = (1-\xi)\,A_0\bigl[w_0+s^{(0)}_\eta(\eta-\tfrac12)+s^{(0)}_\zeta(\zeta-\tfrac12)\bigr]
+        + \xi\,A_1\bigl[w_1+s^{(1)}_\eta(\eta-\tfrac12)+s^{(1)}_\zeta(\zeta-\tfrac12)\bigr]
+        + \tfrac12\bar A\,c\,\xi(\xi-1),
+\end{equation}
+where the tangential slopes $s$ are central differences of $w$ over the
+neighbouring faces (one-sided at the domain edge) and $c$ is the mean second
+difference of $w$ across the cell's two faces. The slope terms integrate to
+zero over each face and the quadratic term vanishes on both faces, so every
+face carries exactly its WRF flux, and the ground and model lid remain
+impermeable. Differencing $w$ rather than $\phi$ keeps a constant wind exact on
+stretched layers. On box grids, order 2 reproduces a linear wind to round-off
+and makes all velocity components continuous across faces
+(\texttt{tests/test\_wrf\_reconstruction.py}). It costs about $2.3\times$ the
+first-order RK4 time.
+
+\section{Data and method}
+
+\paragraph{Data.} WRF output \texttt{wrf\_f005.nc} (polar stereographic,
+$\Delta x=\SI{3.33}{km}$, 60 terrain-following layers, lowest layer
+$\approx\SI{25}{m}$ thick), with \texttt{wrf\_f004.nc} for the time-dependent case.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.55\textwidth]{region}
+  \caption{Terrain height of the WRF domain, the study window (red box) and
+  the cross-section of Fig.~\ref{fig:section} (dashed).}
+  \label{fig:region}
+\end{figure}
+
+\paragraph{Study window.} $192\times192$ columns, $i=60$--$252$, $j=248$--$440$
+(Fig.~\ref{fig:region}): East Antarctic plateau, the Transantarctic Mountains
+(slopes above 3\% in 15\% of the window) and the flat Ross Ice Shelf (53\% of
+the window below \SI{10}{m}).
+Seeds are placed at every cell corner of the window on all 61 levels
+($2.27\times10^6$ seeds); particles move over the whole domain.
+
+\paragraph{Integration.} Backward in time, $T=\SI{-3600}{s}$, frozen wind from
+\texttt{wrf\_f005} unless stated otherwise, RK4 with CFL 0.5 (509 steps),
+using the C++ integrator (double precision). FTLE is the cell-centred 3-D FTLE
+of \texttt{wrf\_ftle}. Differences are reported relative to the FTLE scale
+$S=\SI{1.40e-3}{s^{-1}}$, the 99th percentile of the order-2 FTLE.
+Approximate heights above ground of the levels quoted below: level 0
+\SI{13}{m}, 1 \SI{45}{m}, 3 \SI{145}{m}, 5 \SI{290}{m}, 10 \SI{880}{m},
+20 \SI{3.1}{km}, 30 \SI{7.0}{km}, 40 \SI{13.6}{km}, 55 \SI{27}{km}.
+
+\paragraph{Separating the effects.} The two orders are compared with the
+same seeds, time step and grid, so any difference comes from the reconstruction.
+A time-step series (CFL 1, 0.5, 0.25) checks that time-stepping error is
+small compared with the order difference.
+
+\paragraph{Grid refinement.} WRF cannot be refined, so the data were
+\emph{coarsened} by $c=2$ and $4$: every $c$-th corner is kept and fine face
+fluxes are summed over $c\times c$ sub-faces (with their areas). This conserves
+the flux through every coarse face exactly (checked to $10^{-15}$), so the
+coarse grids are nested, flux-consistent versions of the fine one. A common
+set of seeds (every 4th corner and level, $49\times49\times16$) is tracked on
+all three grids with both orders and the same time step, and the final
+positions and FTLE are compared. If both orders converge to the same limit,
+their difference must shrink as the grid is refined.
+
+\section{Results}
+
+\subsection{Overall size of the differences}
+
+Over all $2.2\times10^6$ cells, $|\mathrm{FTLE}_2-\mathrm{FTLE}_1|/S$ has a
+median of 2.2\%, a 95th percentile of 15\% and a 99th percentile of 33\%;
+72\% of cells differ by more than 1\% and 10\% by more than 10\%.
+
+The time step is not the cause (Fig.~\ref{fig:timestep}). Halving CFL from 0.5
+to 0.25 changes the FTLE by a median of $4.0\times10^{-5}S$ at order 1 and
+$6.6\times10^{-6}S$ at order 2 (95th percentiles $7.6\times10^{-4}S$ and
+$1.5\times10^{-4}S$), while the two orders differ by a median of $2.1\times10^{-2}S$
+at the same CFL. The order difference is therefore a spatial-discretisation
+effect, 100--1000 times larger than the time-stepping error; order 2 is also
+about five times less sensitive to the time step, consistent with its smoother
+velocity field.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.48\textwidth]{timestep}
+  \caption{95th percentile, per level, of the FTLE change between CFL 1 or 0.5
+  and CFL 0.25 for each order, against the difference between the orders
+  (black).}
+  \label{fig:timestep}
+\end{figure}
+
+\subsection{Where the differences occur}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.95\textwidth]{maps}
+  \caption{FTLE of order 1 (left) and order 2 (centre) and their difference
+  (right) at four levels. Black contours on the difference maps: terrain
+  slope 3\%.}
+  \label{fig:maps}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.8\textwidth]{section}
+  \caption{Cross-section along $j=344$ from the plateau (left) over the
+  mountains to the ice shelf (right), lowest \SI{8}{km}. Grey: terrain.}
+  \label{fig:section}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{by_level}
+  \caption{Left: distribution of $|\mathrm{FTLE}_2-\mathrm{FTLE}_1|/S$ per
+  level. Right: mean FTLE per level for both orders.}
+  \label{fig:bylevel}
+\end{figure}
+
+Figures~\ref{fig:maps}--\ref{fig:bylevel} show three regimes.
+
+\paragraph{The ground layer (level 0).} The largest and only strongly
+systematic differences. The first-order field has sharp-edged ``holes'' of
+near-zero FTLE, mostly over the flat ice shelf (Fig.~\ref{fig:maps}, top row,
+and the near-surface blocks in Fig.~\ref{fig:section}) that are absent at
+order 2. The median difference is 10.5\% of $S$ and the 95th percentile 99\%;
+the mean first-order FTLE of the layer is 25\% lower
+(\num{1.02e-3} versus \SI{1.36e-3}{s^{-1}}, Fig.~\ref{fig:bylevel}, right).
+
+\paragraph{The free atmosphere (levels 1--40).} Small and unbiased: median
+differences 1.5--3.3\% of $S$, mean FTLE per level equal to within about 1\%.
+The differences are fine-scale and of both signs, lying along the edges of
+FTLE filaments (levels 3 and 10 in Fig.~\ref{fig:maps}); aloft (level 30,
+\SI{7}{km}) they become smooth, larger-scale patterns of about 10\% of $S$,
+where the layers are several hundred metres thick and the first-order wind
+is constant over that depth.
+
+\paragraph{The thick upper layers (levels $\gtrsim 40$, above \SI{14}{km}).}
+Median differences rise again to 4--6\% and first-order holes reappear
+(Fig.~\ref{fig:predictors}, left).
+
+\subsection{A predictable pattern: trapped seeds}
+
+The holes have a simple cause. At order 1 the horizontal wind is constant with
+height inside a layer, and a seed lying exactly on a level is assigned to the
+layer above it. Integrating backward in time, a seed on a level moves down
+where $W>0$ on that level and up where $W\le0$. In a cell with
+$W\le0$ on its bottom face and $W>0$ on its top face (a layer into which the
+time-reversed vertical flow converges), the seed on the bottom face stays in
+the cell and the seed on the top face drifts down into it: both then move with
+the \emph{same} first-order wind and do not separate vertically, so the
+first-order FTLE collapses. At order 2 the wind varies linearly with height
+inside the layer and the two seeds keep separating. At the ground $W=0$, so
+the condition reduces to $W>0$ on level 1. For forward integration the signs
+flip ($W\ge0$ below, $W<0$ above).
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{predictors}
+  \caption{Left: percentage of cells with a first-order hole
+  ($\mathrm{FTLE}_1<\mathrm{FTLE}_2/4$) per level, for trapped cells
+  ($W\le0$ below, $W>0$ above) and all other cells; dotted: share of trapped
+  cells. Centre: distribution of $(\mathrm{FTLE}_1-\mathrm{FTLE}_2)/S$ for
+  trapped and other cells. Right: median $|\Delta\mathrm{FTLE}|/S$ against the
+  decile of the FTLE gradient within each level.}
+  \label{fig:predictors}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \caption{First-order holes ($\mathrm{FTLE}_1<\mathrm{FTLE}_2/4$) in trapped
+  cells and in all other cells; $F_1,F_2$: first- and second-order FTLE.}
+  \label{tab:trapped}
+  \small
+  \begin{tabular}{lrrrr}
+    \toprule
+     & cells & hole rate & median $F_1/F_2$ & mean $(F_1-F_2)/S$ \\
+    \midrule
+    trapped cells & 9.6\% & 15.2\% & 0.89 & $-10.1\%$ \\
+    other cells   & 90.4\% & 1.0\% & 1.00 & $-0.5\%$ \\
+    \midrule
+    level 0, trapped  & 24\% & 50\% & 0.27 & \\
+    level 55, trapped & 18\% & 21\% & 0.63 & \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Table~\ref{tab:trapped} confirms the rule: trapped cells are 9.6\% of all cells
+but contain 61\% of the holes, with a hole rate of 15\% against 1\% elsewhere,
+and carry the systematic negative bias of order 1. The effect is strongest in
+the ground layer (half of its trapped cells are holes) and in the thick upper
+layers; in the thin layers of the lower and middle troposphere a trapped seed
+soon leaves the layer and the effect is weak (hole rates below 1\% at levels
+1--5). At level 0, the mean bias is $-40\%$ of $S$ where $W>0$ on level 1 and
+$-11\%$ where $W\le0$.
+
+The size of the wind jump between layers does \emph{not} predict the
+differences (rank correlation $-0.04$ within trapped cells), so the effect
+depends on the vertical motion, not on the shear.
+
+Away from trapped cells the differences are largest where the FTLE field is
+sharpest (Fig.~\ref{fig:predictors}, right): from the smoothest to the sharpest
+decile of the FTLE gradient the median difference rises from 1.4\% to 3.3\%
+(levels 3--14) and from 3.1\% to 6.1\% (levels 0--2), as expected if the
+reconstruction mainly shifts ridges slightly. Near the ground the differences
+also grow with terrain slope, from 4.2\% (slope below 0.5\%) to 6.2\% (slope
+above 10\%) of $S$ in levels 0--2.
+
+\paragraph{Time-dependent wind.} With the wind interpolated between
+\texttt{wrf\_f004} and \texttt{wrf\_f005}, the statistics are almost identical
+(median 2.1\%, 95th percentile 14\%, level 0 median 10.9\%; Fig.~\ref{fig:timedep}).
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.45\textwidth]{timedep}
+  \caption{Median $|\mathrm{FTLE}_2-\mathrm{FTLE}_1|/S$ per level, frozen
+  versus time-dependent wind.}
+  \label{fig:timedep}
+\end{figure}
+
+\subsection{Do the two orders converge to the same field?}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{resolution}
+  \caption{Median distance between final particle positions on the common
+  seed lattice for grids coarsened by $c=1,2,4$: between the orders on the same
+  grid (black), and of each order against the finest grid. Left: the two
+  lowest seed levels; right: seed levels 8--60. Grey: slopes $\propto c$ and
+  $\propto c^2$.}
+  \label{fig:resolution}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{resolution_maps}
+  \caption{FTLE of the lowest cell layer of the common seed lattice (seed
+  levels 0--4) on the native ($c=1$) and coarsened ($c=2,4$) grids.}
+  \label{fig:resmaps}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \caption{Median FTLE differences on the common seed lattice, relative to
+  $S$, for grids coarsened by $c$ (\SI{3.3}{km}, \SI{6.7}{km}, \SI{13.3}{km}).}
+  \label{tab:resolution}
+  \begin{tabular}{lrrr}
+    \toprule
+     & $c=1$ & $c=2$ & $c=4$ \\
+    \midrule
+    order 2 vs order 1, same grid        & 1.2\% & 2.8\% & 4.9\% \\
+    order 2 vs order 2 at $c=1$          & ---   & 0.7\% & 3.0\% \\
+    order 1 vs order 1 at $c=1$          & ---   & 2.0\% & 5.8\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The difference between the orders shrinks steadily as the grid is refined
+(Fig.~\ref{fig:resolution}, Table~\ref{tab:resolution}). For final positions
+above the lowest seed levels it falls from \SI{4.8}{km} ($c=4$) to
+\SI{2.3}{km} ($c=2$) to \SI{1.1}{km} ($c=1$), about a halving per refinement
+(median displacement \SI{26}{km}); for the FTLE it falls from 4.9\% to 2.8\% to
+1.2\% of $S$. Near the ground it shrinks more slowly (\SI{2.2}{km},
+\SI{1.5}{km}, \SI{0.9}{km}), where the trapping artefact of order 1 depends on
+the vertical motion and not on the grid spacing alone.
+
+Each order also converges towards its own finest-grid result. Second-order
+FTLE changes about three times less than first-order FTLE between $c=2$ and
+$c=1$ (0.7\% versus 2.0\%), and the second-order field at \SI{6.7}{km} is
+closer to the second-order field at \SI{3.3}{km} than the two orders are to
+each other at \SI{3.3}{km} (0.7\% versus 1.2\%). Visually
+(Fig.~\ref{fig:resmaps}), order 2 keeps the structure of the ground-layer FTLE
+down to $c=4$, while order 1 develops large holes as the layers thicken.
+
+With only three resolutions, and the native WRF grid as the finest, these
+figures are estimates of the trend, not a proof of convergence. They are,
+however, consistent with both reconstructions converging to the same FTLE
+field, with an inter-order difference that decreases roughly in proportion to
+the grid spacing --- the signature of the first-order error dominating it.
+
+\section{Independent check with NumbaCS-3D}
+
+The comparisons above cannot say which order is closer to the truth. As an
+independent reference, the same seeds were integrated with the 3-D
+development version of NumbaCS (A.~Jarvis, \texttt{flows\_3D.py},
+\texttt{integration\_3D.py}), which interpolates a velocity given on a
+uniform grid with tensor-product cubic splines (or linearly) and integrates
+with the adaptive DOP853 scheme (relative tolerance $10^{-6}$). Both the
+interpolation and the integrator are unrelated to \texttt{wrf\_ftle}'s.
+
+\paragraph{Setup.} NumbaCS-3D needs a uniform grid, so it runs in the same
+index space $(p,q,r)$. Its input is the usual destaggered velocity:
+horizontally at cell centres, vertically on the model levels. $\dot p,\dot q$
+are the cell-centre values (mean of the two face fluxes over $J$), averaged
+between the layers below and above each level and extrapolated linearly to
+the ground and lid; $\dot r$ is the face flux over $J$ on each level, hence
+exactly zero on the ground and the lid, which the tensor-product splines keep
+impermeable. The grid covers the study window plus a 50-cell margin (more than
+the farthest displacement, about 43 cells); no particle came within 3 cells of
+its edge. Seeds: every second corner of the window on all 61 levels
+($5.7\times10^5$ seeds); frozen wind from \texttt{wrf\_f005}, $T=\SI{-3600}{s}$;
+\texttt{wrf\_ftle} at CFL 0.25. Final positions of all methods are converted to
+metres with the same trilinear map and the FTLE is computed with the same code,
+so only the trajectories differ.
+
+\begin{table}[t]
+  \centering
+  \caption{Median distance between final positions (median displacements
+  \SI{10.6}{km}, \SI{14.6}{km} and \SI{27.4}{km}) and FTLE differences relative to
+  the scale $S$ (99th percentile of the NumbaCS cubic FTLE), $5.7\times10^5$ seeds.}
+  \label{tab:numbacs}
+  \small
+  \begin{tabular}{lrrrrrr}
+    \toprule
+     & \multicolumn{3}{c}{final position (m)} & \multicolumn{3}{c}{FTLE / $S$} \\
+    \cmidrule(lr){2-4}\cmidrule(lr){5-7}
+     & ground & levels 1--10 & levels 11--60 & median & 95th & 99th \\
+    \midrule
+    order 1 vs NumbaCS cubic          & 1890 & 499 & 1168 & 2.4\%  & 14\%  & 29\% \\
+    order 2 vs NumbaCS cubic          & 60   & 242 & 404  & 1.05\% & 6.0\% & 11\% \\
+    order 1 vs order 2                & 1904 & 486 & 1134 & 2.1\%  & 14\%  & 29\% \\
+    NumbaCS cubic vs NumbaCS linear   & 43   & 92  & 56   & 0.16\% & 1.3\% & 3.2\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.45\textwidth]{numbacs_by_level}
+  \caption{Median $|\Delta\mathrm{FTLE}|/S$ per cell layer of each method
+  against NumbaCS cubic.}
+  \label{fig:numbacs_level}
+\end{figure}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=\textwidth]{numbacs_maps}
+  \caption{FTLE from NumbaCS-3D (cubic), \texttt{wrf\_ftle} order 2 and
+  order 1, and the differences of the two orders from NumbaCS, for four cell
+  layers of the seed lattice.}
+  \label{fig:numbacs_maps}
+\end{figure}
+
+\paragraph{Results.} The two NumbaCS interpolants agree with each other closely
+(median FTLE difference 0.16\%), so they provide a consistent reference
+(Table~\ref{tab:numbacs}). The second-order result is two to three times
+closer to it than the first-order one in FTLE (median 1.05\% versus 2.4\%, 99th
+percentile 11\% versus 29\%), three times closer in final positions above the
+ground and thirty times closer at the ground (\SI{60}{m} versus \SI{1890}{m}).
+The first-order deviation from NumbaCS is nearly the same as its deviation from
+order 2, i.e.\ the difference between the orders is almost entirely
+first-order error. By level (Fig.~\ref{fig:numbacs_level}) the first-order
+deviation peaks in the ground layer (median 11\%) and the top layer (11\%),
+where order 2 deviates by 1.1\% and 0.4\%.
+
+NumbaCS shows none of the first-order holes: cells with
+$\mathrm{FTLE}<\mathrm{FTLE}_\text{cubic}/4$ make up 1.5\% of cells at order 1
+(9.3\% of the ground layer) against 0.04\% at order 2 (0.01\%)
+(Fig.~\ref{fig:numbacs_maps}). What remains between order 2 and NumbaCS is
+small-scale and of both signs, mostly along FTLE filaments over the mountains,
+where the two interpolations of the unresolved small scales differ.
+
+\section{Analytic benchmark}
+
+Agreement between methods does not tell which is accurate: the two NumbaCS
+interpolants agree closely on the WRF case partly because they interpolate
+the \emph{same} node values, which come from destaggering the face fluxes. To
+rank the methods, all of them were run on an analytic wind whose exact
+trajectories are known (\texttt{scripts/bench\_analytic.py}).
+
+\paragraph{Setup.} A box of $240\times240\times\SI{10}{km}$ with WRF-like
+stretched layers $z(s)=H\,(e^{4s}-1)/(e^4-1)$ at three nested resolutions:
+$\Delta x=5$, 2.5 and \SI{1.25}{km} with 10, 20 and 40 layers (bottom layer
+92, 41 and \SI{20}{m}). The steady wind is divergence-free (to $10^{-12}$) with
+$w=0$ on the ground and the lid: a boundary-layer shear profile
+$U(z)=6(1-e^{-z/\SI{400}{m}})+4z/H$, two convective rolls (in $x$--$z$ and
+$y$--$z$, $|w|$ up to \SI{0.6}{m/s}) and horizontal vortices; speeds reach
+\SI{16}{m/s}. Face fluxes are integrated exactly ($4\times4$ Gauss), so the
+discrete data are exact. Seeds are the corners of the coarsest grid over the
+central \SI{120}{km} on all its 11 levels (6875 seeds, on cell faces at every
+resolution); $T=\SI{-3600}{s}$ (median displacement \SI{22}{km}). Exact
+trajectories use RK4 with $\Delta t=\SI{1}{s}$ (converged to $10^{-8}$\,m);
+\texttt{wrf\_ftle} uses 400 steps; NumbaCS uses DOP853. NumbaCS is given either
+the destaggered node data, built from the face fluxes exactly as for WRF, or
+the exact analytic velocity at its nodes --- the best input it could have, but
+not one available from WRF output. FTLE errors are relative to the 99th
+percentile of the exact FTLE.
+
+\begin{table}[t]
+  \centering
+  \caption{Errors against the exact solution at the three resolutions:
+  median final-position error of ground seeds and of seeds on levels $\ge4$,
+  and median FTLE error relative to $S$.}
+  \label{tab:bench}
+  \small
+  \begin{tabular}{lrrrrrrrrr}
+    \toprule
+     & \multicolumn{3}{c}{ground seeds (m)} & \multicolumn{3}{c}{levels $\ge4$ (m)} & \multicolumn{3}{c}{FTLE error / $S$ (\%)} \\
+    \cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+    $\Delta x$ (km) & 5 & 2.5 & 1.25 & 5 & 2.5 & 1.25 & 5 & 2.5 & 1.25 \\
+    \midrule
+    order 1                         & 2331 & 1057 & 507  & 768 & 250 & 84  & 1.75 & 0.64 & 0.22 \\
+    order 2                         & 103  & 34   & 9.1  & 60  & 8.5 & 1.4 & 0.17 & 0.020 & 0.0038 \\
+    NumbaCS cubic, destaggered      & 339  & 85   & 21   & 330 & 84  & 21  & 0.67 & 0.17 & 0.042 \\
+    NumbaCS linear, destaggered     & 676  & 171  & 42   & 591 & 153 & 38  & 0.93 & 0.25 & 0.063 \\
+    \midrule
+    NumbaCS cubic, exact nodes      & 1.3  & 0.07 & 0.005 & 33 & 8.4 & 2.2 & 0.038 & 0.0088 & 0.0021 \\
+    NumbaCS linear, exact nodes     & 350  & 86   & 21   & 296 & 74  & 18  & 0.28 & 0.076 & 0.020 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{bench_convergence}
+  \caption{Errors against the exact solution versus grid spacing. Grey:
+  slopes $\propto\Delta x$ and $\propto\Delta x^2$.}
+  \label{fig:bench}
+\end{figure}
+
+\paragraph{Results.} (Table~\ref{tab:bench}, Fig.~\ref{fig:bench}.)
+\begin{itemize}
+  \item \emph{Order 1} converges at first order near the ground (errors halve per
+  refinement) and somewhat faster above; it has the largest errors at every
+  resolution and 2.3\% holes on the coarsest grid.
+  \item \emph{Order 2} converges at second order or better: ground errors fall
+  by $3$--$4\times$ per refinement, errors above the ground by $6$--$7\times$ and
+  FTLE errors by $5$--$8\times$. At \SI{1.25}{km} it is 55 times more accurate
+  than order 1 at the ground and 60 times in FTLE.
+  \item \emph{NumbaCS on destaggered data} converges at second order
+  (errors fall $4\times$ per refinement), but the destaggering step limits it:
+  at every resolution its errors are 2--15 times larger than order 2's, with
+  the cubic spline about twice as accurate as the linear interpolant. This is
+  why the two NumbaCS runs agree with each other on WRF yet both differ from
+  order 2: they share the destaggering error.
+  \item \emph{NumbaCS on exact nodes} is the most accurate at the ground, where
+  the exact nodal wind is smooth in height, and its FTLE errors are about half
+  of order 2's. Above the ground its position errors are comparable to order 2's
+  (equal at \SI{2.5}{km}, larger at \SI{1.25}{km}). Such nodal data are not
+  available from WRF, which provides face fluxes.
+\end{itemize}
+
+\paragraph{The destaggering error.} WRF stores each velocity component on the
+faces normal to it (an Arakawa C grid), whereas collocated tools such as
+NumbaCS need all three components at the same nodes. Moving the data from the
+faces to the nodes --- averaging the two cell-centre values on either side of
+a level, extrapolating at the ground and the lid --- is itself an
+approximation, and it is made once, before any interpolation: no interpolant
+applied afterwards can recover what the averaging lost. The benchmark
+isolates it by running the same cubic interpolant and integrator on
+destaggered and on exact node values. Destaggering accounts for almost all of
+the NumbaCS error: final-position errors above the ground grow from
+\SIlist{33;8.4;2.2}{m} to \SIlist{330;84;21}{m}, those of ground seeds from
+\SIlist{1.3;0.07;0.005}{m} to \SIlist{339;85;21}{m}, and the median FTLE error
+from 0.038, 0.0088, 0.0021\% to 0.67, 0.17, 0.042\% of $S$ at $\Delta x=5$,
+2.5 and \SI{1.25}{km}, i.e.\ about ten times in positions and twenty times in
+FTLE. The destaggering error converges at second order (it falls fourfold per
+refinement) and lies between the two mimetic reconstructions: it is 2--25
+times smaller than the total error of order 1 but 2--15 times larger than that
+of order 2, which works directly from the face fluxes and so never
+destaggers. On stretched layers the averaging is particularly crude, because
+a level does not lie midway in height between the centres of the layers above
+and below it.
+
+Of the methods that can be fed WRF's face fluxes, order 2 is therefore the
+most accurate. The benchmark wind is smooth and well resolved (scales of
+45--\SI{70}{km}); in WRF output with under-resolved small scales all methods
+lose accuracy, and the margins will be smaller.
+
+\section{Conclusions}
+
+\begin{enumerate}
+  \item \textbf{Where.} Over most of the atmosphere the two orders give nearly
+  the same FTLE: median differences of 1.5--3\% of the FTLE scale, unbiased,
+  concentrated along sharp FTLE ridges. Large, systematic differences occur in
+  the ground layer (first-order FTLE 25\% lower on average) and in the thick
+  upper layers above about \SI{14}{km}.
+  \item \textbf{Predictable pattern.} The systematic differences are a
+  first-order artefact with a simple rule: in cells into which the
+  (time-reversed) vertical flow converges --- $W\le0$ on the bottom face and
+  $W>0$ on the top face for backward FTLE --- both bounding seeds share one
+  layer's constant first-order wind and the FTLE collapses. These cells hold
+  61\% of the first-order holes. Order 2 avoids this because its wind varies
+  linearly with height inside each layer.
+  \item \textbf{Convergence.} The difference between the orders shrinks
+  roughly in proportion to the grid spacing under coarsening, and order 2 is
+  about three times less sensitive to resolution, so the evidence is that both
+  converge to the same FTLE field, with order 1's error dominating at WRF's
+  native resolution. At \SI{3.3}{km} the remaining median difference is about
+  1--2\%, but individual first-order cells can be wrong by 100\%.
+  \item \textbf{Independent check.} NumbaCS-3D (cubic splines, DOP853) agrees
+  with order 2 two to three times better than with order 1 and has none of
+  the first-order holes. Against exact trajectories of an analytic wind on
+  WRF-like stretched layers, order 2 converges at second order or better and is
+  the most accurate of the methods that use the face fluxes: 10 times more
+  accurate in FTLE than NumbaCS on destaggered data and 60 times more than
+  order 1 at \SI{1.25}{km}.
+  \item \textbf{Recommendation.} Use order 2 (the default). Treat first-order
+  FTLE in the lowest layer and in thick upper layers with caution, especially
+  where the vertical velocity changes sign across a layer. The extra cost of
+  order 2 (about $2.3\times$ the RK4 time) is small compared with the
+  accuracy gained.
+\end{enumerate}
+
+\appendix
+\section{Reproducing}
+\begin{verbatim}
+python scripts/order_study_run.py WRF_DIR DATA_DIR
+python scripts/order_study_figures.py DATA_DIR WRF_DIR \
+       report/order2/figures
+cd report/order2 && latexmk -pdf order2.tex
+\end{verbatim}
+NumbaCS-3D comparison (stage 2 runs in the environment of the NumbaCS-3D
+development scripts, here \texttt{\textasciitilde/work/CSP-224-FTLE}):
+\begin{verbatim}
+STRIDE=2 python scripts/numbacs_compare_export.py WRF_DIR export.npz
+NUMBACS3D/venv/bin/python scripts/numbacs_compare_run.py \
+       NUMBACS3D export.npz numbacs.npz
+python scripts/numbacs_compare_analyse.py WRF_DIR export.npz \
+       numbacs.npz report/order2/figures
+\end{verbatim}
+Analytic benchmark (stage 2 for each \texttt{<res>} in c, m, f and
+\texttt{<variant>} in destag, exact):
+\begin{verbatim}
+python scripts/bench_analytic.py prepare BENCH_DIR
+NUMBACS3D/venv/bin/python scripts/numbacs_compare_run.py NUMBACS3D \
+       BENCH_DIR/numbacs_in_<res>_<variant>.npz \
+       BENCH_DIR/numbacs_out_<res>_<variant>.npz
+python scripts/bench_analytic.py analyse BENCH_DIR report/order2/figures
+\end{verbatim}
+{\sloppy
+\texttt{WRF\_DIR} holds \texttt{wrf\_f004.nc} and \texttt{wrf\_f005.nc}.
+Numbers quoted in the text are in \texttt{figures/stats.json}, \texttt{figures/numbacs\_stats.json} and \texttt{figures/bench\_stats.json}.\par}
+
+\end{document}
