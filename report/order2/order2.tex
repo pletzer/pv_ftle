@@ -503,7 +503,7 @@ percentile of the exact FTLE.
   than order 1 at the ground and 60 times in FTLE.
   \item \emph{NumbaCS on destaggered data} converges at second order
   (errors fall $4\times$ per refinement), but the destaggering step limits it:
-  at every resolution its errors are 3--15 times larger than order 2's, with
+  at every resolution its errors are 2--15 times larger than order 2's, with
   the cubic spline about twice as accurate as the linear interpolant. This is
   why the two NumbaCS runs agree with each other on WRF yet both differ from
   order 2: they share the destaggering error.
@@ -513,6 +513,29 @@ percentile of the exact FTLE.
   (equal at \SI{2.5}{km}, larger at \SI{1.25}{km}). Such nodal data are not
   available from WRF, which provides face fluxes.
 \end{itemize}
+
+\paragraph{The destaggering error.} WRF stores each velocity component on the
+faces normal to it (an Arakawa C grid), whereas collocated tools such as
+NumbaCS need all three components at the same nodes. Moving the data from the
+faces to the nodes --- averaging the two cell-centre values on either side of
+a level, extrapolating at the ground and the lid --- is itself an
+approximation, and it is made once, before any interpolation: no interpolant
+applied afterwards can recover what the averaging lost. The benchmark
+isolates it by running the same cubic interpolant and integrator on
+destaggered and on exact node values. Destaggering accounts for almost all of
+the NumbaCS error: final-position errors above the ground grow from
+\SIlist{33;8.4;2.2}{m} to \SIlist{330;84;21}{m}, those of ground seeds from
+\SIlist{1.3;0.07;0.005}{m} to \SIlist{339;85;21}{m}, and the median FTLE error
+from 0.038, 0.0088, 0.0021\% to 0.67, 0.17, 0.042\% of $S$ at $\Delta x=5$,
+2.5 and \SI{1.25}{km}, i.e.\ about ten times in positions and twenty times in
+FTLE. The destaggering error converges at second order (it falls fourfold per
+refinement) and lies between the two mimetic reconstructions: it is 2--25
+times smaller than the total error of order 1 but 2--15 times larger than that
+of order 2, which works directly from the face fluxes and so never
+destaggers. On stretched layers the averaging is particularly crude, because
+a level does not lie midway in height between the centres of the layers above
+and below it.
+
 Of the methods that can be fed WRF's face fluxes, order 2 is therefore the
 most accurate. The benchmark wind is smooth and well resolved (scales of
 45--\SI{70}{km}); in WRF output with under-resolved small scales all methods
