@@ -14,6 +14,7 @@ sys.path.insert(0, plugin_dir)
 # C++ extensions
 from pv_ftle import _ftlecpp as ftlecpp
 from pv_ftle.uvw_palm_reader import UVWPalmReader
+from pv_ftle.ftle_common import FtleBase
 
 try:
     # paraview 6.x
@@ -396,12 +397,24 @@ time eigenvalue:  {tm5 - tm4:.3f} sec
         return dict(
             x=xaxis, y=yaxis, z=zaxis,
             ftle=ftle,
+            solid=solid[:, self.jmin:self.jmax, self.imin:self.imax].astype(bool),
         )
+
+def visualise(res: dict, level: int=0, cmax: float=None):
+    """
+    Interactive PyVista level viewer (z/Z = down/up), as in wrf_ftle.
+    Building cells are shown in grey.
+    """
+    zz, yy, xx = np.meshgrid(res['z'], res['y'], res['x'], indexing='ij')
+    ftle = np.where(res['solid'], np.nan, res['ftle'])
+    FtleBase().visualise(dict(r_corners=np.stack([xx, yy, zz], axis=-1), ftle=ftle),
+                         level=level, cmax=cmax, title_prefix='PALM FTLE')
 
 def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cfl:float=0.25,
          imin: int=1, imax: int=-2, jmin: int=1, jmax: int=-2,
          time_index: int=0, frozen: bool=False, checksum: bool=False,
-         zero_fill: bool=True, order: int=2, verbose: bool=False):
+         zero_fill: bool=True, order: int=2, visualise_ftle: bool=False,
+         level: int=0, cmax: float=None, verbose: bool=False):
     """
     Compute the Finite Time Lyapunov Exponent
 
@@ -418,6 +431,9 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     @param checksum whether to compute a checksum
     @param zero_fill replace masked fill values (e.g. -9999 building cells) with zero
     @param order velocity reconstruction: 1 (lowest-order Raviart-Thomas) or 2
+    @param visualise_ftle open an interactive level viewer after writing vtkout
+    @param level starting vertical level of the viewer (negative counts from top)
+    @param cmax colour-scale maximum of the viewer (min=0); None = data-driven
     @param verbose to print messages
     """
     pf = PalmFtle()
@@ -472,6 +488,9 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     writer.SetDataModeToBinary()
     writer.SetInputData(rgrid)
     writer.Update()
+
+    if visualise_ftle:
+        visualise(res, level=level, cmax=cmax)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -540,6 +559,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "across the cell and linear along each face, using only fluid "
                         "data next to buildings (default: %(default)s).")
 
+    p.add_argument("--visualise", action="store_true",
+                   help="Open an interactive PyVista level viewer (z/Z = down/up); "
+                        "building cells are grey.")
+    p.add_argument("--level", type=int, default=0,
+                   help="Starting vertical level of the viewer (k index); negative "
+                        "counts from top (default: %(default)s)")
+    p.add_argument("--cmax", type=float, default=None,
+                   help="Colour-scale maximum of the viewer (min=0); default: data-driven")
+
     return p
 
 
@@ -560,6 +588,9 @@ def cli():
         checksum=args.checksum,
         zero_fill=args.zero_fill,
         order=args.order,
+        visualise_ftle=args.visualise,
+        level=args.level,
+        cmax=args.cmax,
         verbose=args.verbose,
     )
 
