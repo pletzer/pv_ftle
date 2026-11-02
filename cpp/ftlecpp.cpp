@@ -5,6 +5,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <cstdint>
 #ifdef HAVE_OMP
 #include <omp.h>
 #endif
@@ -529,6 +530,301 @@ py::array_t<double> integrate_rk4_curvilinear(
 
 
 // =============================================================================
+// PALM / rectilinear integrator with order 1|2 reconstruction and solid cells
+// =============================================================================
+//
+// Grid: corner axes x (nx+1), y (ny+1), z (nz+1), not necessarily uniform.
+// Face velocities (flux / area, i.e. the normal velocity) on the staggered
+// grids, axes ordered (k, j, i):
+//   u : (nt, nz,   ny,   nx+1)    x-faces
+//   v : (nt, nz,   ny+1, nx  )    y-faces
+//   w : (nt, nz+1, ny,   nx  )    z-faces
+// solid : (nz, ny, nx) uint8, 1 for cells inside buildings.
+//
+// A face is "fluid" if both its cells are fluid, "wall" if exactly one is
+// solid (its normal velocity is then exactly 0) and "solid" if both are.
+// Cells outside the domain count as fluid.  Rules (order 2):
+//   * inside a solid cell the velocity is 0;
+//   * wall and solid faces carry 0 and no tangential slopes, so walls stay
+//     impermeable everywhere on the face;
+//   * a fluid face takes tangential slopes from neighbouring faces that are
+//     not solid (a wall's 0 is valid data): central, one-sided if one side is
+//     unavailable, 0 if both are;
+//   * the second difference across a face is used only at fluid faces; the
+//     quadratic term of a cell averages those available at its two faces.
+// Positions, time and arithmetic are double.
+
+struct RectFace {
+    const float*   v0;        // snapshot ti0
+    const float*   v1;        // snapshot ti1
+    double om, mu;
+    int dims[3];              // face grid (k, j, i)
+    int ax;                   // normal axis: 0 = k, 1 = j, 2 = i
+    const uint8_t* solid;     // cell mask (nz, ny, nx)
+    int ncell[3];             // (nz, ny, nx)
+
+    bool cell_solid(int k, int j, int i) const {
+        if (k < 0 || j < 0 || i < 0 || k >= ncell[0] || j >= ncell[1] || i >= ncell[2])
+            return false;
+        return solid[((size_t)k * ncell[1] + j) * ncell[2] + i] != 0;
+    }
+    // 0 fluid, 1 wall, 2 solid
+    int type(const int c[3]) const {
+        int lo[3] = {c[0], c[1], c[2]};
+        lo[ax] -= 1;                               // cell on the low side of the face
+        return (int)cell_solid(lo[0], lo[1], lo[2]) + (int)cell_solid(c[0], c[1], c[2]);
+    }
+    bool inside(const int c[3]) const {
+        return c[0] >= 0 && c[1] >= 0 && c[2] >= 0 &&
+               c[0] < dims[0] && c[1] < dims[1] && c[2] < dims[2];
+    }
+    double val(const int c[3]) const {             // 0 on wall and solid faces
+        if (type(c) != 0) return 0.0;
+        const size_t n = ((size_t)c[0] * dims[1] + c[1]) * dims[2] + c[2];
+        return om * v0[n] + mu * v1[n];
+    }
+    bool usable(const int c[3]) const { return inside(c) && type(c) != 2; }
+    double slope(const int c[3], int t) const {
+        int lo[3] = {c[0], c[1], c[2]}, hi[3] = {c[0], c[1], c[2]};
+        lo[t] -= 1; hi[t] += 1;
+        const bool ul = usable(lo), uh = usable(hi);
+        if (ul && uh) return 0.5 * (val(hi) - val(lo));
+        if (uh)       return val(hi) - val(c);
+        if (ul)       return val(c) - val(lo);
+        return 0.0;
+    }
+    bool second_diff(const int c[3], double& d2) const {
+        if (type(c) != 0) return false;            // only at fluid faces
+        int lo[3] = {c[0], c[1], c[2]}, hi[3] = {c[0], c[1], c[2]};
+        lo[ax] -= 1; hi[ax] += 1;
+        if (!inside(lo) || !inside(hi)) return false;
+        d2 = val(lo) - 2.0 * val(c) + val(hi);
+        return true;
+    }
+};
+
+// Normal velocity component of the face grid f at local coordinates
+// l = (ζ, η, ξ) in cell (k, j, i).
+static inline double rect_component(const RectFace& f, const int cell[3],
+                                    const double l[3], int order)
+{
+    int c0[3] = {cell[0], cell[1], cell[2]};
+    int c1[3] = {cell[0], cell[1], cell[2]};
+    c1[f.ax] += 1;
+    const double x = l[f.ax];
+    double w0 = f.val(c0), w1 = f.val(c1);
+    if (order < 2)
+        return (1.0 - x) * w0 + x * w1;
+
+    const bool fl0 = f.type(c0) == 0, fl1 = f.type(c1) == 0;
+    for (int t = 0; t < 3; t++) {
+        if (t == f.ax) continue;
+        const double dl = l[t] - 0.5;
+        if (fl0) w0 += f.slope(c0, t) * dl;
+        if (fl1) w1 += f.slope(c1, t) * dl;
+    }
+    double d2, curv = 0.0;
+    int nd2 = 0;
+    if (f.second_diff(c0, d2)) { curv += d2; nd2++; }
+    if (f.second_diff(c1, d2)) { curv += d2; nd2++; }
+    if (nd2) curv /= nd2;
+    return (1.0 - x) * w0 + x * w1 + 0.5 * curv * x * (x - 1.0);
+}
+
+// Index of the interval of the ascending axis a[0..n] containing x (clamped)
+// and the local coordinate in [0, 1].
+static inline int locate(const double* a, int ncells, double x, double& loc)
+{
+    int i = (int)(std::upper_bound(a, a + ncells + 1, x) - a) - 1;
+    i = std::clamp(i, 0, ncells - 1);
+    loc = std::clamp((x - a[i]) / (a[i + 1] - a[i]), 0.0, 1.0);
+    return i;
+}
+
+struct RectGrid {
+    const double *xa, *ya, *za, *t_arr;
+    int nx, ny, nz, nt;
+    const float *u, *v, *w;
+    const uint8_t* solid;
+    bool frozen;
+    int order;
+
+    bool is_solid(int i, int j, int k) const {
+        return solid[((size_t)k * ny + j) * nx + i] != 0;
+    }
+
+    // Cell (i, j, k) and local coordinates of the point.  A point exactly on
+    // a face of a solid cell (e.g. a seed on a building wall) is assigned to
+    // the fluid cell on the other side of that face.  Returns false if the
+    // point is inside a building.
+    bool find_cell(double x, double y, double z, int c[3], double loc[3]) const {
+        c[0] = locate(xa, nx, x, loc[0]);
+        c[1] = locate(ya, ny, y, loc[1]);
+        c[2] = locate(za, nz, z, loc[2]);
+        for (int a = 0; a < 3 && is_solid(c[0], c[1], c[2]); a++) {
+            if (loc[a] == 0.0 && c[a] > 0) { c[a] -= 1; loc[a] = 1.0; }
+        }
+        return !is_solid(c[0], c[1], c[2]);
+    }
+
+    bool solid_at(double x, double y, double z) const {
+        int c[3]; double loc[3];
+        return !find_cell(x, y, z, c, loc);
+    }
+
+    void velocity(double x, double y, double z, double t, double vel[3]) const {
+        int c[3]; double loc[3];
+        if (!find_cell(x, y, z, c, loc)) { vel[0] = vel[1] = vel[2] = 0.0; return; }
+        const int i = c[0], j = c[1], k = c[2];
+        const double xi = loc[0], eta = loc[1], zeta = loc[2];
+
+        int ti0 = 0;
+        double mu = 0.0;
+        if (!frozen && nt > 1) {
+            const double* it = std::upper_bound(t_arr, t_arr + nt, t);
+            ti0 = std::clamp((int)(it - t_arr) - 1, 0, nt - 2);
+            const double dts = t_arr[ti0 + 1] - t_arr[ti0];
+            mu = (dts > 0.0) ? std::clamp((t - t_arr[ti0]) / dts, 0.0, 1.0) : 0.0;
+        }
+        const int ti1 = (frozen || nt == 1) ? 0 : ti0 + 1;
+        const size_t su = (size_t)nz * ny * (nx + 1), sv = (size_t)nz * (ny + 1) * nx,
+                     sw = (size_t)(nz + 1) * ny * nx;
+        const RectFace fu{u + ti0 * su, u + ti1 * su, 1.0 - mu, mu, {nz, ny, nx + 1}, 2, solid, {nz, ny, nx}};
+        const RectFace fv{v + ti0 * sv, v + ti1 * sv, 1.0 - mu, mu, {nz, ny + 1, nx}, 1, solid, {nz, ny, nx}};
+        const RectFace fw{w + ti0 * sw, w + ti1 * sw, 1.0 - mu, mu, {nz + 1, ny, nx}, 0, solid, {nz, ny, nx}};
+        const int cell[3] = {k, j, i};
+        const double l[3] = {zeta, eta, xi};
+        vel[0] = rect_component(fu, cell, l, order);
+        vel[1] = rect_component(fv, cell, l, order);
+        vel[2] = rect_component(fw, cell, l, order);
+    }
+
+    // A step that ends inside a building slides along the wall it crossed:
+    // each coordinate whose crossing alone leads into a solid cell is clamped
+    // just short of that face; if the particle is still inside, the step is
+    // undone.
+    void keep_out_of_solid(const double old[3], double p[3]) const {
+        int io[3], in[3];
+        double lo[3], ln[3];
+        if (find_cell(p[0], p[1], p[2], in, ln)) return;
+        if (!find_cell(old[0], old[1], old[2], io, lo)) return;   // started inside: leave it
+        const double* axes[3] = {xa, ya, za};
+        for (int a = 0; a < 3; a++) {
+            if (in[a] == io[a]) continue;
+            int c[3] = {io[0], io[1], io[2]};
+            c[a] = in[a];
+            if (is_solid(c[0], c[1], c[2])) {
+                const double* ax = axes[a];
+                const double h = ax[io[a] + 1] - ax[io[a]];
+                p[a] = (in[a] > io[a]) ? ax[io[a] + 1] - 1e-9 * h : ax[io[a]] + 1e-9 * h;
+            }
+        }
+        if (solid_at(p[0], p[1], p[2]))
+            for (int a = 0; a < 3; a++) p[a] = old[a];
+    }
+};
+
+using u8_array = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>;
+
+static RectGrid make_rect_grid(const py::array_t<double, py::array::c_style | py::array::forcecast>& xa,
+                               const py::array_t<double, py::array::c_style | py::array::forcecast>& ya,
+                               const py::array_t<double, py::array::c_style | py::array::forcecast>& za,
+                               const py::array_t<float,  py::array::c_style | py::array::forcecast>& u,
+                               const py::array_t<float,  py::array::c_style | py::array::forcecast>& v,
+                               const py::array_t<float,  py::array::c_style | py::array::forcecast>& w,
+                               const u8_array& solid,
+                               const py::array_t<double, py::array::c_style | py::array::forcecast>& t_axis,
+                               bool frozen, int order)
+{
+    RectGrid g{xa.data(), ya.data(), za.data(), t_axis.data(),
+               (int)xa.shape(0) - 1, (int)ya.shape(0) - 1, (int)za.shape(0) - 1, (int)t_axis.shape(0),
+               u.data(), v.data(), w.data(), solid.data(), frozen, order};
+    const int nt = g.nt, nz = g.nz, ny = g.ny, nx = g.nx;
+    auto chk = [](bool ok, const char* name) {
+        if (!ok) throw std::runtime_error(std::string(name) + " has the wrong shape");
+    };
+    chk(u.ndim() == 4 && u.shape(0) == nt && u.shape(1) == nz && u.shape(2) == ny && u.shape(3) == nx + 1, "u");
+    chk(v.ndim() == 4 && v.shape(0) == nt && v.shape(1) == nz && v.shape(2) == ny + 1 && v.shape(3) == nx, "v");
+    chk(w.ndim() == 4 && w.shape(0) == nt && w.shape(1) == nz + 1 && w.shape(2) == ny && w.shape(3) == nx, "w");
+    chk(solid.ndim() == 3 && solid.shape(0) == nz && solid.shape(1) == ny && solid.shape(2) == nx, "solid");
+    return g;
+}
+
+// RK4 on the rectilinear grid.  xyz0: flat float64 (3N,) = [x0..xN, y0..yN, z0..zN].
+py::array_t<double> integrate_rk4_rectilinear(
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& xyz0,
+    double t0, double dt, int nsteps,
+    const py::array_t<float,  py::array::c_style | py::array::forcecast>& u,
+    const py::array_t<float,  py::array::c_style | py::array::forcecast>& v,
+    const py::array_t<float,  py::array::c_style | py::array::forcecast>& w,
+    const u8_array& solid,
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& xa,
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& ya,
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& za,
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& t_axis,
+    bool frozen, int order)
+{
+    if (xyz0.ndim() != 1 || xyz0.shape(0) % 3 != 0)
+        throw std::runtime_error("xyz0 must be flat float64 array of length 3*N");
+    const RectGrid g = make_rect_grid(xa, ya, za, u, v, w, solid, t_axis, frozen, order);
+    const size_t N = (size_t)(xyz0.shape(0) / 3);
+    std::vector<double> pos(xyz0.data(), xyz0.data() + 3 * N);
+
+    for (int step = 0; step < nsteps; ++step) {
+        const double t = t0 + (double)step * dt;
+        #pragma omp parallel for schedule(static)
+        for (size_t n = 0; n < N; ++n) {
+            const double p[3] = {pos[n], pos[n + N], pos[n + 2 * N]};
+            double k1[3], k2[3], k3[3], k4[3];
+            g.velocity(p[0], p[1], p[2], t, k1);
+            g.velocity(p[0] + 0.5*dt*k1[0], p[1] + 0.5*dt*k1[1], p[2] + 0.5*dt*k1[2], t + 0.5*dt, k2);
+            g.velocity(p[0] + 0.5*dt*k2[0], p[1] + 0.5*dt*k2[1], p[2] + 0.5*dt*k2[2], t + 0.5*dt, k3);
+            g.velocity(p[0] + dt*k3[0], p[1] + dt*k3[1], p[2] + dt*k3[2], t + dt, k4);
+            double q[3];
+            for (int d = 0; d < 3; d++) {
+                q[d] = p[d] + dt / 6.0 * (k1[d] + 2.0*k2[d] + 2.0*k3[d] + k4[d]);
+                if (!std::isfinite(q[d])) q[d] = p[d];
+            }
+            g.keep_out_of_solid(p, q);
+            pos[n] = q[0]; pos[n + N] = q[1]; pos[n + 2 * N] = q[2];
+        }
+    }
+    py::array_t<double> result(3 * N);
+    auto res = result.mutable_unchecked<1>();
+    for (size_t i = 0; i < 3 * N; ++i) res(i) = pos[i];
+    return result;
+}
+
+// Velocity at points (for tests and diagnostics).  Returns flat (3N,).
+py::array_t<double> velocity_rectilinear(
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& xyz,
+    double t,
+    const py::array_t<float,  py::array::c_style | py::array::forcecast>& u,
+    const py::array_t<float,  py::array::c_style | py::array::forcecast>& v,
+    const py::array_t<float,  py::array::c_style | py::array::forcecast>& w,
+    const u8_array& solid,
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& xa,
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& ya,
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& za,
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& t_axis,
+    bool frozen, int order)
+{
+    const RectGrid g = make_rect_grid(xa, ya, za, u, v, w, solid, t_axis, frozen, order);
+    const size_t N = (size_t)(xyz.shape(0) / 3);
+    const double* p = xyz.data();
+    py::array_t<double> result(3 * N);
+    double* r = result.mutable_data();
+    #pragma omp parallel for schedule(static)
+    for (size_t n = 0; n < N; ++n) {
+        double vel[3];
+        g.velocity(p[n], p[n + N], p[n + 2 * N], t, vel);
+        r[n] = vel[0]; r[n + N] = vel[1]; r[n + 2 * N] = vel[2];
+    }
+    return result;
+}
+
+
+// =============================================================================
 // Pybind11 module
 // =============================================================================
 PYBIND11_MODULE(_ftlecpp, m) {
@@ -575,4 +871,23 @@ PYBIND11_MODULE(_ftlecpp, m) {
           "order     : 1 (lowest-order Raviart–Thomas) or 2 (quadratic/linear)\n"
           "horizontal: if True, dr/dt = 0 (particles stay on their model level)\n"
           "Returns   : flat float64 (3*N,) final reference positions.");
+
+    m.def("integrate_rk4_rectilinear", &integrate_rk4_rectilinear,
+          py::arg("xyz0"), py::arg("t0"), py::arg("dt"), py::arg("nsteps"),
+          py::arg("u"), py::arg("v"), py::arg("w"), py::arg("solid"),
+          py::arg("xaxis"), py::arg("yaxis"), py::arg("zaxis"), py::arg("t_axis"),
+          py::arg("frozen"), py::arg("order") = 2,
+          "PALM / rectilinear RK4 with order 1|2 reconstruction and solid cells.\n\n"
+          "xyz0     : flat float64 (3*N,) [x0..xN, y0..yN, z0..zN]\n"
+          "u, v, w  : float32 (nt, ...) face velocities on (nz,ny,nx+1), (nz,ny+1,nx), (nz+1,ny,nx)\n"
+          "solid    : uint8 (nz, ny, nx), 1 inside buildings\n"
+          "xaxis, yaxis, zaxis : float64 corner axes (nx+1), (ny+1), (nz+1)\n"
+          "t_axis   : float64 (nt,) snapshot times, ascending\n"
+          "Returns  : flat float64 (3*N,) final positions.");
+    m.def("velocity_rectilinear", &velocity_rectilinear,
+          py::arg("xyz"), py::arg("t"),
+          py::arg("u"), py::arg("v"), py::arg("w"), py::arg("solid"),
+          py::arg("xaxis"), py::arg("yaxis"), py::arg("zaxis"), py::arg("t_axis"),
+          py::arg("frozen"), py::arg("order") = 2,
+          "Velocity of integrate_rk4_rectilinear at points xyz (flat float64 (3*N,)).");
 }

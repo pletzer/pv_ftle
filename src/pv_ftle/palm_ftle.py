@@ -101,6 +101,23 @@ def gradient_corner_to_center(Xf: np.ndarray, dx: float, dy: float, dz: np.ndarr
     return dXdx, dXdy, dXdz
 
 
+def solid_cells(mu: np.ndarray, mv: np.ndarray, mw: np.ndarray,
+                ground_face_added: bool) -> np.ndarray:
+    """
+    Cells inside buildings, (nz, ny, nx) bool, from the fill-value masks of the
+    trimmed face arrays u (nz, ny, nx+1), v (nz, ny+1, nx), w (nz+1, ny, nx).
+
+    PALM masks a face whenever one of its cells is inside a building, so a cell
+    is solid when all of its faces are masked.  If the ground face was added
+    (not in the file), the bottom face of the lowest cells is not checked.
+    """
+    bottom = mw[:-1].copy()
+    if ground_face_added:
+        bottom[0] = True
+    return (mu[:, :, :-1] & mu[:, :, 1:] & mv[:, :-1, :] & mv[:, 1:, :]
+            & bottom & mw[1:])
+
+
 class PalmFtle:
 
     def __init__(self):
@@ -117,6 +134,7 @@ class PalmFtle:
         self.frozen = False
         self.checksum = True
         self.zero_fill = True
+        self.order = 2       # velocity reconstruction: 1 or 2
 
         self.verbose = False
 
@@ -228,16 +246,19 @@ NetCDF variable names:
         zuaxis = reader.getUVZAxis()
         t_axis = reader.getTimeAxis()
         uface, vface, wface = reader.getFaceFluxes()
+        mu_raw, mv_raw, mw_raw = reader.getFillMasks()
 
         # ── extend zw_xy if the bottom face is missing ────────────────────────
         # zw_xy should bracket zu_xy: zw_xy[0] < zu_xy[0] < zw_xy[1].
         # PALM sometimes omits the lowest face; reconstruct it by reflection:
         #   z_bottom = 2 * zu_xy[0] - zw_xy[0]
         # and prepend a zero-velocity w slice (ground no-penetration BC).
-        if zaxis[0] > zuaxis[0]:
+        ground_face_added = bool(zaxis[0] > zuaxis[0])
+        if ground_face_added:
             z_bottom = 2.0 * float(zuaxis[0]) - float(zaxis[0])
             zaxis = np.concatenate([[z_bottom], zaxis])
             wface = np.concatenate([np.zeros_like(wface[:, :1]), wface], axis=1)
+            mw_raw = np.concatenate([np.zeros_like(mw_raw[:1]), mw_raw], axis=0)
             if self.verbose:
                 print(f'Extended zw_xy: prepended z_bottom={z_bottom:.2f} m  '
                       f'(zu_xy[0]={float(zuaxis[0]):.2f} m  '
@@ -276,7 +297,7 @@ NetCDF variable names:
         # seed positions at grid corners; shape (nz1, ny1, nx1)
         zz, yy, xx = np.meshgrid(zaxis, yaxis, xaxis, indexing="ij")
         n = xx.size
-        xyz0 = np.concatenate([xx.ravel(), yy.ravel(), zz.ravel()]).astype(np.float32)
+        xyz0 = np.concatenate([xx.ravel(), yy.ravel(), zz.ravel()]).astype(np.float64)
 
         # --------------------------------------------------------------
         # Trim staggering halos and prepare float32 arrays for RK4
@@ -292,10 +313,15 @@ NetCDF variable names:
         uface_clean = np.array(uface[:, :, :-1, :],   dtype=np.float32)
         vface_clean = np.array(vface[:, :, :,   :-1], dtype=np.float32)
         wface_clean = np.array(wface[:, :, :-1, :-1], dtype=np.float32)
-        xaxis_clean = np.array(xaxis_full, dtype=np.float32)
-        yaxis_clean = np.array(yaxis_full, dtype=np.float32)
-        zaxis_clean = np.array(zaxis,      dtype=np.float32)
-        t_axis_clean = np.array(t_axis,    dtype=np.float32)
+        solid = solid_cells(mu_raw[:, :-1, :], mv_raw[:, :, :-1], mw_raw[:, :-1, :-1],
+                            ground_face_added).astype(np.uint8)
+        xaxis_clean = np.array(xaxis_full, dtype=np.float64)
+        yaxis_clean = np.array(yaxis_full, dtype=np.float64)
+        zaxis_clean = np.array(zaxis,      dtype=np.float64)
+        t_axis_clean = np.array(t_axis,    dtype=np.float64)
+        if self.verbose:
+            print(f'order={self.order}  solid cells: {int(solid.sum())} '
+                  f'({100.0 * solid.mean():.2f}%)')
 
         if self.verbose:
             print(f'nx1={nx1} ny1={ny1} nz1={nz1}')
@@ -309,24 +335,11 @@ w: shape={wface_clean.shape} type={wface_clean.dtype}''')
         # --------------------------------------------------------------
         time_val = float(t_all[self.time_index])   # snapshot time (RK4 steps backward/forward from here)
         dt_step = self.tintegr / nsteps
-        xyz = ftlecpp.integrate_rk4(
-            xyz0,
-            time_val,
-            dt_step,
-            nsteps,
-            uface_clean,
-            vface_clean,
-            wface_clean,
-            xaxis_clean,
-            yaxis_clean,
-            zaxis_clean,
-            dx,
-            dy,
-            nx1_full,
-            ny1_full,
-            nz1,
-            self.frozen,
-            t_axis_clean,
+        xyz = ftlecpp.integrate_rk4_rectilinear(
+            xyz0, time_val, dt_step, nsteps,
+            uface_clean, vface_clean, wface_clean, solid,
+            xaxis_clean, yaxis_clean, zaxis_clean, t_axis_clean,
+            self.frozen, self.order,
         )
 
         tm3 = time.perf_counter()
@@ -388,7 +401,7 @@ time eigenvalue:  {tm5 - tm4:.3f} sec
 def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cfl:float=0.25,
          imin: int=1, imax: int=-2, jmin: int=1, jmax: int=-2,
          time_index: int=0, frozen: bool=False, checksum: bool=False,
-         zero_fill: bool=True, verbose: bool=False):
+         zero_fill: bool=True, order: int=2, verbose: bool=False):
     """
     Compute the Finite Time Lyapunov Exponent
 
@@ -404,6 +417,7 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     @param frozen whether to freeze the velocity while computing the trajectories
     @param checksum whether to compute a checksum
     @param zero_fill replace masked fill values (e.g. -9999 building cells) with zero
+    @param order velocity reconstruction: 1 (lowest-order Raviart-Thomas) or 2
     @param verbose to print messages
     """
     pf = PalmFtle()
@@ -418,6 +432,7 @@ def main(*, palmfile: str='', vtkout: str='palm_ftle.vtr', tintegr:float=-10, cf
     pf.frozen = frozen
     pf.checksum = checksum
     pf.zero_fill = zero_fill
+    pf.order = order
     pf.verbose = verbose
 
     #res = pf.compute_ftle()
@@ -519,6 +534,12 @@ def build_parser() -> argparse.ArgumentParser:
                            "produces artefacts at building boundaries.")
     p.set_defaults(zero_fill=True)
 
+    p.add_argument("--order", type=int, choices=(1, 2), default=2,
+                   help="Velocity reconstruction: 1 = lowest-order Raviart-Thomas "
+                        "(each component linear between its two faces), 2 = quadratic "
+                        "across the cell and linear along each face, using only fluid "
+                        "data next to buildings (default: %(default)s).")
+
     return p
 
 
@@ -538,6 +559,7 @@ def cli():
         frozen=args.frozen,
         checksum=args.checksum,
         zero_fill=args.zero_fill,
+        order=args.order,
         verbose=args.verbose,
     )
 
