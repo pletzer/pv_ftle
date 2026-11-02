@@ -161,7 +161,8 @@ NumbaCS and an analytic benchmark, is in `report/order2/order2.pdf`.
 
 ## How to invoke the Paraview plugin
 
-The computation of the finite time Lypunov exponent can be performed within Paraview using a source plugin. 
+The computation of the finite time Lypunov exponent can be performed within Paraview using a source plugin. (Currently only the 
+PALM FTLE computation is available as a Paraview plugin.)
 
 The plugin must have been installed with `pip install .` and the Python version bundled with
 Paraview must be compatible the virtual environment Python (e.g. 3.12). 
