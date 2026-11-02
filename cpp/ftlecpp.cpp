@@ -72,17 +72,20 @@ void interp_velocity(
 
         int time_index0, time_index1;
         float mu;
-        if (frozen) {
+        if (frozen || t_axis.shape(0) < 2) {
             time_index0 = 0;
             mu = 0.0f;
             time_index1 = 0;
         } else {
-            size_t nt = t_axis.shape(0);
-            float dt_uniform = t_r(1) - t_r(0);
-            float idxf = (time_val - t_r(0)) / dt_uniform;
-            time_index0 = std::clamp(int(std::floor(idxf)), 0, int(nt - 2));
-            time_index1 = std::clamp(time_index0 + 1, 1, int(nt - 1));
-            mu = std::clamp(idxf - time_index0, 0.0f, 1.0f);
+            // PALM output times are not evenly spaced: locate the bracketing
+            // snapshots on the actual time axis
+            int nt = int(t_axis.shape(0));
+            const float* t_ptr = t_axis.data();
+            int it = int(std::upper_bound(t_ptr, t_ptr + nt, time_val) - t_ptr) - 1;
+            time_index0 = std::clamp(it, 0, nt - 2);
+            time_index1 = time_index0 + 1;
+            float dts = t_r(time_index1) - t_r(time_index0);
+            mu = (dts > 0.0f) ? std::clamp((time_val - t_r(time_index0)) / dts, 0.0f, 1.0f) : 0.0f;
         }
 
         // interpolate u, v, w
