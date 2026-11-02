@@ -397,7 +397,7 @@ time eigenvalue:  {tm5 - tm4:.3f} sec
         return dict(
             x=xaxis, y=yaxis, z=zaxis,
             ftle=ftle,
-            solid=solid[:, self.jmin:self.jmax, self.imin:self.imax].astype(bool),
+            solid=solid[:, self.jmin:self.jmin + ny, self.imin:self.imin + nx].astype(bool),
         )
 
 def visualise(res: dict, level: int=0, cmax: float=None):
