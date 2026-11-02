@@ -96,6 +96,20 @@ class PalmFtleSource(VTKPythonAlgorithmBase):
         self.pf.frozen = bool(value)
         self.Modified()
 
+    # 1 = lowest-order Raviart-Thomas, 2 = quadratic across the cell and
+    # linear along each face, using only fluid data next to buildings
+    @smproperty.intvector(name="Order", number_of_elements=1, default_values=[2])
+    @smdomain.xml("""
+        <EnumerationDomain name="enum">
+            <Entry value="1" text="1"/>
+            <Entry value="2" text="2"/>
+        </EnumerationDomain>
+        <Documentation>Velocity reconstruction order</Documentation>
+    """)
+    def SetOrder(self, value):
+        self.pf.order = int(value)
+        self.Modified()
+
     @smproperty.intvector(name="Verbose", number_of_elements=1, default_values=[0])
     def SetVerbose(self, value):
         self.pf.verbose = bool(value)

@@ -53,6 +53,7 @@ class UVWPalmReader(UVWBaseReader):
         self._uface: np.ndarray | None = None
         self._vface: np.ndarray | None = None
         self._wface: np.ndarray | None = None
+        self._masks: tuple | None = None          # fill-value masks of u, v, w
         self._xaxis:  np.ndarray | None = None
         self._yaxis:  np.ndarray | None = None
         self._zaxis:  np.ndarray | None = None   # w face-z axis (zw_xy)
@@ -161,6 +162,7 @@ class UVWPalmReader(UVWBaseReader):
         u_chunks: list[np.ndarray] = []
         v_chunks: list[np.ndarray] = []
         w_chunks: list[np.ndarray] = []
+        masks = [None, None, None]                # union over the loaded times
         offset = 0
 
         for f, t in zip(self.filenames, all_times):
@@ -170,12 +172,12 @@ class UVWPalmReader(UVWBaseReader):
             if file_start < file_stop:
                 fsl = slice(file_start, file_stop)
                 with netCDF4.Dataset(f) as nc:
-                    u_chunks.append(
-                        self._to_float32(nc.variables[fld['u']][fsl], self.zero_fill))
-                    v_chunks.append(
-                        self._to_float32(nc.variables[fld['v']][fsl], self.zero_fill))
-                    w_chunks.append(
-                        self._to_float32(nc.variables[fld['w']][fsl], self.zero_fill))
+                    for c, (key, chunks) in enumerate(
+                            (('u', u_chunks), ('v', v_chunks), ('w', w_chunks))):
+                        arr = nc.variables[fld[key]][fsl]
+                        m = np.ma.getmaskarray(arr).any(axis=0)
+                        masks[c] = m if masks[c] is None else masks[c] | m
+                        chunks.append(self._to_float32(arr, self.zero_fill))
             offset += nt_f
 
         def _cat(chunks):
@@ -184,6 +186,7 @@ class UVWPalmReader(UVWBaseReader):
         self._uface = _cat(u_chunks)
         self._vface = _cat(v_chunks)
         self._wface = _cat(w_chunks)
+        self._masks = tuple(masks)
 
     def _ensure_loaded(self) -> None:
         if self._taxis is None:
@@ -206,6 +209,15 @@ class UVWPalmReader(UVWBaseReader):
         """
         self._ensure_loaded()
         return self._uface, self._vface, self._wface
+
+    def getFillMasks(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return boolean masks (u, v, w) of the fill values (e.g. buildings),
+        True where a value was masked at any loaded time.  Same layout as
+        getFaceFluxes() without the time axis.  PALM masks a face whenever
+        one of its two cells is inside a building.
+        """
+        self._ensure_loaded()
+        return self._masks
 
     def getAxes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return the 1-D coordinate axes (x, y, z).

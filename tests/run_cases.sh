@@ -16,6 +16,9 @@ palm_ftle "$PALM" --imin=10 --imax=80 --jmin=10 --jmax=80 \
 palm_ftle "$PALM" --imin=10 --imax=80 --jmin=10 --jmax=80 \
     --tintegr=5 --time-index=2 --vtkout="$OUT/palm_forward.vtr" --checksum --verbose
 
+palm_ftle "$PALM" --imin=10 --imax=80 --jmin=10 --jmax=80 --order=1 \
+    --tintegr=-5 --time-index=8 --vtkout="$OUT/palm_backward_order1.vtr" --checksum --verbose
+
 # index-space WRF FTLE: time-dependent velocity, interpolated between the
 # hourly wrf_f*.nc snapshots, and frozen at a single snapshot
 wrf_ftle "data/wrf_f*.nc" "${WRF_SEEDS[@]}" \
