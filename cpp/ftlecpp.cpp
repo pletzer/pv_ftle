@@ -105,7 +105,9 @@ void interp_velocity(
 }
 
 // -----------------------------------------------------------------------------
-// RK4 integration  (PALM / rectilinear)
+// RK4 integration  (PALM / rectilinear), legacy first-order float32 kernel.
+// palm_ftle uses integrate_rk4_rectilinear; this one is kept only so that
+// scripts/ftle_variants.py can reproduce the June fixes report.
 // -----------------------------------------------------------------------------
 py::array_t<float> integrate_rk4(
     const py::array_t<float>& xyz0,
